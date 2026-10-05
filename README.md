@@ -4,23 +4,23 @@ This package is a simple wrapper for the [rforest](https://github.com/jjgarzella
 
 ## Install
 
-The tested wrapper source is pinned to commit
-`08a4ebbbca9008ae7478d4ec541fa026034d76b6`. It pins the native `rforest`
-source to `4bad17781bb3e0842753b1d16fd8a2bf36af99cd`.
+The native `rforest` source is pinned at
+`460cf1754df13f879df9ff2601508d47ff1ece38`, the head of [rforest PR #3](https://github.com/jjgarzella/rforest/pull/3)
+on `features/ring-p2-matmul`. The submodule source repository is
+`https://github.com/jjgarzella/rforest.git`.
 
-Clone that wrapper commit and initialize its pinned native submodule:
+Clone this wrapper change and initialize its pinned native submodule:
 
 ```
-git clone https://github.com/jjgarzella/pyrforest.git
+git clone --branch deps/rforest-pr3 https://github.com/jjgarzella/pyrforest.git
 cd pyrforest
-git checkout 08a4ebbbca9008ae7478d4ec541fa026034d76b6
 git submodule sync --recursive
 git submodule update --init --recursive
 git -C pyrforest/lib rev-parse HEAD
 ```
 
-The final command prints the native source commit listed above. Install from
-the checkout with Sage:
+The final command prints the native source commit listed above. Install from the
+checkout with Sage:
 
 ```
 sage -pip install --no-build-isolation --upgrade .
