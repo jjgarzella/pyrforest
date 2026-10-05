@@ -4,34 +4,40 @@ This package is a simple wrapper for the [rforest](https://github.com/jjgarzella
 
 ## Install
 
+The tested wrapper source is pinned to commit
+`08a4ebbbca9008ae7478d4ec541fa026034d76b6`. It pins the native `rforest`
+source to `4bad17781bb3e0842753b1d16fd8a2bf36af99cd`.
+
+Clone that wrapper commit and initialize its pinned native submodule:
+
 ```
-sage -pip install --no-build-isolation --upgrade git+https://github.com/jjgarzella/pyrforest.git
+git clone https://github.com/jjgarzella/pyrforest.git
+cd pyrforest
+git checkout 08a4ebbbca9008ae7478d4ec541fa026034d76b6
+git submodule sync --recursive
+git submodule update --init --recursive
+git -C lib rev-parse HEAD
 ```
 
-If you don't have permissions to install it system wide, please add the flag ``--user`` to install it just for you.
+The final command prints the native source commit listed above. Install from
+the checkout with Sage:
 
 ```
-sage -pip install --user --no-build-isolation --upgrade git+https://github.com/jjgarzella/pyrforest.git
+sage -pip install --no-build-isolation --upgrade .
 ```
+
+To install for your user account, add `--user` to the install command.
 
 ## Development
 
-Clone with submodules:
-```
-git clone --recurse-submodules https://github.com/jjgarzella/pyrforest.git
-```
+Use the pinned checkout steps above, then install in editable mode:
 
-If you already cloned without `--recurse-submodules`:
-```
-git submodule update --init
-```
-
-Then install in editable mode:
 ```
 make install
 ```
 
 Run tests:
+
 ```
 make test
 ```
