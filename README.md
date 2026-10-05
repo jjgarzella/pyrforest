@@ -1,24 +1,24 @@
 # pyrforest
 
-This package is a simple wrapper for the [rforest](https://github.com/edgarcosta/rforest) library code into SageMath.
+This package is a simple wrapper for the [rforest](https://github.com/jjgarzella/rforest) library code into SageMath.
 
 ## Install
 
 ```
-sage -pip install --no-build-isolation --upgrade git+https://github.com/edgarcosta/pyrforest.git
+sage -pip install --no-build-isolation --upgrade git+https://github.com/jjgarzella/pyrforest.git
 ```
 
 If you don't have permissions to install it system wide, please add the flag ``--user`` to install it just for you.
 
 ```
-sage -pip install --user --no-build-isolation --upgrade git+https://github.com/edgarcosta/pyrforest.git
+sage -pip install --user --no-build-isolation --upgrade git+https://github.com/jjgarzella/pyrforest.git
 ```
 
 ## Development
 
 Clone with submodules:
 ```
-git clone --recurse-submodules https://github.com/edgarcosta/pyrforest.git
+git clone --recurse-submodules https://github.com/jjgarzella/pyrforest.git
 ```
 
 If you already cloned without `--recurse-submodules`:
