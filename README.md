@@ -16,7 +16,7 @@ cd pyrforest
 git checkout 08a4ebbbca9008ae7478d4ec541fa026034d76b6
 git submodule sync --recursive
 git submodule update --init --recursive
-git -C lib rev-parse HEAD
+git -C pyrforest/lib rev-parse HEAD
 ```
 
 The final command prints the native source commit listed above. Install from
