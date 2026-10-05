@@ -38,7 +38,6 @@ rforest = Extension(
         "-fPIC",
         "-fomit-frame-pointer",
         "-funroll-loops",
-        "-m64",
         "-std=gnu11",
         "-Wno-sign-compare",
         "-Wno-unused-function",

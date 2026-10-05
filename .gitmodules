@@ -1,4 +1,4 @@
 [submodule "pyrforest/lib"]
 	path = pyrforest/lib
-	url = https://github.com/edgarcosta/rforest.git
+	url = https://github.com/jjgarzella/rforest.git
 	branch = main
