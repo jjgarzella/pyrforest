@@ -5,9 +5,18 @@ This package is a simple wrapper for the [rforest](https://github.com/jjgarzella
 ## Install
 
 The native `rforest` source is pinned at
-`460cf1754df13f879df9ff2601508d47ff1ece38`, the head of [rforest PR #3](https://github.com/jjgarzella/rforest/pull/3)
-on `features/ring-p2-matmul`. The submodule source repository is
+`9a0a53f6b1a12cab4a845d181a4207905307b6fa`, the exact head of [rforest PR
+#6](https://github.com/jjgarzella/rforest/pull/6) on
+`features/ring-remainder-forest`. The submodule source repository remains
 `https://github.com/jjgarzella/rforest.git`.
+
+This native revision retains the integer-polynomial remainder forest and adds
+the C APIs `rforest_p2`, `rforest_pn`, and `rforest_pnq` for matrix forests over
+`Z[P]/(P^2)`, `Z[P]/(P^n)`, and `Z[P,Q]/(P^N,Q^N)`. See the pinned native
+[`rforest.h`](https://github.com/jjgarzella/rforest/blob/9a0a53f6b1a12cab4a845d181a4207905307b6fa/rforest.h)
+for their signatures. This pyrforest change keeps its existing Python
+interface; it adds no Python bindings for those ring APIs and makes no wrapper
+algorithm changes.
 
 Clone this wrapper change and initialize its pinned native submodule:
 
