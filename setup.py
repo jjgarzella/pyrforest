@@ -20,11 +20,14 @@ except ImportError:
 
 path = os.path.dirname(os.path.abspath(__file__))
 lib_path = os.path.join(path, "pyrforest/lib")
+# Native test programs have their own main() and must not be linked into the extension.
 rforest_sources = [
     os.path.relpath(os.path.join(dp, f), path)
     for dp, _, fn in os.walk(lib_path)
     for f in fn
-    if f.endswith(".c") and f != "test_rforest.c"
+    if f.endswith(".c")
+    and f != "test_rforest.c"
+    and "tests" not in os.path.relpath(dp, lib_path).split(os.sep)
 ]
 
 rforest = Extension(

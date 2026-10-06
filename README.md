@@ -4,23 +4,32 @@ This package is a simple wrapper for the [rforest](https://github.com/jjgarzella
 
 ## Install
 
-The tested wrapper source is pinned to commit
-`08a4ebbbca9008ae7478d4ec541fa026034d76b6`. It pins the native `rforest`
-source to `4bad17781bb3e0842753b1d16fd8a2bf36af99cd`.
+The native `rforest` source is pinned at
+`9a0a53f6b1a12cab4a845d181a4207905307b6fa`, the exact head of [rforest PR
+#6](https://github.com/jjgarzella/rforest/pull/6) on
+`features/ring-remainder-forest`. The submodule source repository remains
+`https://github.com/jjgarzella/rforest.git`.
 
-Clone that wrapper commit and initialize its pinned native submodule:
+This native revision retains the integer-polynomial remainder forest and adds
+the C APIs `rforest_p2`, `rforest_pn`, and `rforest_pnq` for matrix forests over
+`Z[P]/(P^2)`, `Z[P]/(P^n)`, and `Z[P,Q]/(P^N,Q^N)`. See the pinned native
+[`rforest.h`](https://github.com/jjgarzella/rforest/blob/9a0a53f6b1a12cab4a845d181a4207905307b6fa/rforest.h)
+for their signatures. This pyrforest change keeps its existing Python
+interface; it adds no Python bindings for those ring APIs and makes no wrapper
+algorithm changes.
+
+Clone this wrapper change and initialize its pinned native submodule:
 
 ```
-git clone https://github.com/jjgarzella/pyrforest.git
+git clone --branch deps/rforest-pr3 https://github.com/jjgarzella/pyrforest.git
 cd pyrforest
-git checkout 08a4ebbbca9008ae7478d4ec541fa026034d76b6
 git submodule sync --recursive
 git submodule update --init --recursive
 git -C pyrforest/lib rev-parse HEAD
 ```
 
-The final command prints the native source commit listed above. Install from
-the checkout with Sage:
+The final command prints the native source commit listed above. Install from the
+checkout with Sage:
 
 ```
 sage -pip install --no-build-isolation --upgrade .
