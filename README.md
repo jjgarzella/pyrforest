@@ -24,7 +24,7 @@ git clone --branch main https://github.com/jjgarzella/pyrforest.git
 cd pyrforest
 git submodule sync --recursive
 git submodule update --init --recursive
-git -C lib rev-parse HEAD
+git -C pyrforest/lib rev-parse HEAD
 ```
 
 The final command prints the native source commit listed above. Install from the

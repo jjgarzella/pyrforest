@@ -29,6 +29,7 @@ from sage.matrix.constructor import Matrix
 from sage.rings.integer cimport Integer
 from sage.rings.integer_ring import ZZ
 from sage.rings.finite_rings.integer_mod_ring import Integers
+from sage.rings.polynomial.laurent_polynomial_ring_base import LaurentPolynomialRing_generic
 from sage.rings.polynomial.polynomial_ring_constructor import PolynomialRing
 
 
@@ -266,6 +267,8 @@ def _ring_parent_positions(parent, label, allow_x, require_bivariate=False):
         if require_bivariate:
             raise TypeError("%s must use a two-generator integer polynomial ring" % label)
         return {}
+    if isinstance(parent, LaurentPolynomialRing_generic):
+        raise TypeError("%s must use an ordinary polynomial ring, not a Laurent polynomial ring" % label)
     try:
         names = tuple(parent.variable_names())
         coefficient_ring = parent.base_ring()

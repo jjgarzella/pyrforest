@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from sage.all import Integers, Matrix, PolynomialRing, QQ, ZZ, prod
+from sage.all import Integers, LaurentPolynomialRing, Matrix, PolynomialRing, QQ, ZZ, prod
 
 from pyrforest import remainder_forest, remainder_forest_p2, remainder_forest_pn
 from pyrforest.rforest import deflate_matrix, inflate_matrix
@@ -326,6 +326,20 @@ def main():
     Q = PolynomialRing(QQ, names=("u", "t"))
     assert_raises(TypeError, lambda: remainder_forest_pn(Matrix(Q, 1, 1, [1]), [5], [1], 2))
     assert_raises(TypeError, lambda: remainder_forest_pn(M, [5], [1], 2, indices=[[]]))
+
+    # Laurent inputs are rejected before marshalling: the ring bridge only
+    # accepts ordinary polynomial exponents and must not drop negative terms.
+    L = LaurentPolynomialRing(ZZ, names=("u", "t"))
+    P_laurent, x_laurent = L.gens()
+    negative_P = Matrix(L, 1, 1, [P_laurent**-1 + 1])
+    negative_x = Matrix(L, 1, 1, [x_laurent**-1 + 1])
+    assert_raises(TypeError, lambda: remainder_forest_pn(negative_P, [5], [1], 2))
+    assert_raises(TypeError, lambda: remainder_forest_pn(negative_x, [5], [1], 2))
+    negative_V_P = Matrix(L, 1, 2, [P_laurent**-1, 1])
+    negative_V_x = Matrix(L, 1, 2, [x_laurent**-1, 0])
+    assert_raises(TypeError, lambda: remainder_forest_pn(M, [5], [1], 2, V=negative_V_P))
+    assert_raises(TypeError, lambda: remainder_forest_pn(M, [5], [1], 2, V=negative_V_x))
+
     assert remainder_forest_pn(M, [5], [1], 2) == direct_ring_forest(M, [5], [1], 2)
 
     print("PASS exact P²/P^n wrapper references, state, signed endpoints, and validation")
