@@ -1,14 +1,20 @@
 __all__ = [
     "remainder_forest",
+    "remainder_forest_p2",
+    "remainder_forest_pn",
     "remainder_forest_generic_prime",
     "batch_factorial",
     "batch_harmonic",
 ]
 from .rforest import (
     remainder_forest,
+    remainder_forest_p2,
+    remainder_forest_pn,
     remainder_forest_generic_prime,
 )
 assert remainder_forest
+assert remainder_forest_p2
+assert remainder_forest_pn
 assert remainder_forest_generic_prime
 
 from .batch import (

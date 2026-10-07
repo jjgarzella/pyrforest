@@ -13,12 +13,14 @@ and `k_i` and `m_i` are sequences of integers.
 
 from cython cimport sizeof
 from cysignals.signals cimport sig_on, sig_off
+from libc.stddef cimport size_t
 from libc.stdlib cimport malloc, free
 from sage.libs.gmp.mpz cimport (
     mpz_clear,
     mpz_init,
     mpz_init_set,
     mpz_init_set_ui,
+    mpz_set,
 )
 from sage.combinat.integer_vector import IntegerVectors
 from sage.functions.log import log
@@ -26,6 +28,7 @@ from sage.functions.other import ceil
 from sage.matrix.constructor import Matrix
 from sage.rings.integer cimport Integer
 from sage.rings.integer_ring import ZZ
+from sage.rings.finite_rings.integer_mod_ring import Integers
 from sage.rings.polynomial.polynomial_ring_constructor import PolynomialRing
 
 
@@ -255,6 +258,423 @@ cpdef remainder_forest(M, m, k, kbase=0, indices=None, V=None, ans=None, kappa=N
             mpz_clear(A1[i])
         free(A1)
         mpz_clear(z)
+
+
+def _ring_parent_positions(parent, label, allow_x, require_bivariate=False):
+    """Return variable positions, with roles defined by generator order."""
+    if parent == ZZ:
+        if require_bivariate:
+            raise TypeError("%s must use a two-generator integer polynomial ring" % label)
+        return {}
+    try:
+        names = tuple(parent.variable_names())
+        coefficient_ring = parent.base_ring()
+    except (AttributeError, TypeError):
+        raise TypeError("%s must have entries in ZZ or an integer polynomial ring" % label)
+    if coefficient_ring != ZZ:
+        raise TypeError("%s polynomial coefficients must be exact integers" % label)
+    if require_bivariate:
+        if len(names) != 2:
+            raise TypeError("%s must use a two-generator integer polynomial ring" % label)
+        return {"P": 0, "x": 1}
+    if len(names) == 1:
+        return {"P": 0}
+    if len(names) == 2:
+        return {"P": 0, "x": 1}
+    raise TypeError("%s must use ZZ, ZZ[P], or the same two-generator ring as M" % label)
+
+
+def _ring_entry_terms(entry, positions):
+    """Return an entry's exact terms with exponent tuples in parent order."""
+    if not positions:
+        return {(): entry}
+    terms = entry.dict()
+    normalized = {}
+    for exponents, coefficient in terms.items():
+        try:
+            exponents = tuple(exponents)
+        except TypeError:
+            exponents = (exponents,)
+        normalized[exponents] = coefficient
+    return normalized
+
+
+def _ring_integer(value, label):
+    if isinstance(value, bool) or value not in ZZ:
+        raise TypeError("%s must be an exact integer" % label)
+    return Integer(value)
+
+
+def _ring_batch_value(values, position, index):
+    if isinstance(values, dict):
+        return values[index]
+    if callable(values):
+        return values(index)
+    return values[position]
+
+
+def _check_mpz_array_size(count, label):
+    size_max = Integer(2) ** (8 * sizeof(size_t)) - 1
+    if count < 0 or count > size_max // sizeof(mpz_t):
+        raise OverflowError("%s is too large for a native GMP array" % label)
+
+
+def _ring_matrix_terms(M, nP, label, allow_x, require_bivariate=False):
+    """Pack sparse Sage polynomial entries as (P exponent, x degree) maps."""
+    positions = _ring_parent_positions(M.base_ring(), label, allow_x,
+                                       require_bivariate)
+    p_position = positions.get("P")
+    x_position = positions.get("x")
+    term_maps = []
+    degree = 0
+    int_max = Integer(2) ** (8 * sizeof(int) - 1) - 1
+    for row in range(M.dimensions()[0]):
+        for column in range(M.dimensions()[1]):
+            coefficients = {}
+            for exponents, coefficient in _ring_entry_terms(M[row, column], positions).items():
+                p_exponent = exponents[p_position] if p_position is not None else 0
+                x_degree = exponents[x_position] if x_position is not None else 0
+                if not allow_x and x_degree:
+                    raise ValueError("V entries must be independent of x")
+                if p_exponent >= nP:
+                    continue
+                if x_degree > int_max - 1:
+                    raise OverflowError("polynomial degree does not fit a C int")
+                if coefficient:
+                    coefficients[(p_exponent, x_degree)] = coefficient
+                if allow_x and x_degree > degree:
+                    degree = x_degree
+            term_maps.append(coefficients)
+    return term_maps, degree
+
+
+def _ring_matrix_from_terms(terms, rows, dim, nP, modulus, p_name,
+                            identity=False):
+    coefficient_ring = Integers(modulus)
+    polynomial_ring = PolynomialRing(coefficient_ring, p_name)
+    entries = []
+    for row in range(rows):
+        for column in range(dim):
+            coefficients = []
+            for p in range(nP):
+                if identity and p == 0 and row == column:
+                    coefficient = 1
+                elif terms is None:
+                    coefficient = 0
+                else:
+                    coefficient = terms[row * dim + column].get((p, 0), 0)
+                coefficients.append(coefficient_ring(coefficient))
+            entries.append(polynomial_ring(coefficients))
+    return Matrix(polynomial_ring, rows, dim, entries)
+
+
+def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
+                           kappa=None, return_state=False, fixed_p2=False,
+                           initial_z=None):
+    """Shared safe marshalling layer for the native P² and P^n forests."""
+    cdef mpz_t *A1 = NULL
+    cdef mpz_t *V1 = NULL
+    cdef mpz_t *M1 = NULL
+    cdef mpz_t *m1 = NULL
+    cdef long *k1 = NULL
+    cdef mpz_t z
+    cdef Integer tmp
+    cdef size_t A_initialized = 0
+    cdef size_t V_initialized = 0
+    cdef size_t M_initialized = 0
+    cdef size_t m_initialized = 0
+    cdef bint z_initialized = False
+    cdef int rows_c, dim_c, deg_c, nP_c, kappa_c
+    cdef long n_c, kbase_c
+    cdef size_t A_count_c, V_count_c, M_count_c, m_count_c
+    cdef size_t t, r, c, p, d
+
+    precision = _ring_integer(nP, "nP")
+    if precision < 1:
+        raise ValueError("nP must be positive")
+    nP = int(precision)
+    int_max = Integer(2) ** (8 * sizeof(int) - 1) - 1
+    long_min = -(Integer(2) ** (8 * sizeof(long) - 1))
+    long_max = -long_min - 1
+    if nP > int_max:
+        raise OverflowError("nP does not fit a C int")
+
+    if not hasattr(M, "is_square") or not M.is_square():
+        raise ValueError("M must be a square Sage matrix")
+    dim = M.dimensions()[0]
+    if dim <= 0:
+        raise ValueError("M must have positive dimension")
+    native_dim = dim
+    M_terms, deg = _ring_matrix_terms(M, nP, "M", True, True)
+
+    if V is None:
+        rows = dim
+        V_terms = None
+    else:
+        if not hasattr(V, "dimensions"):
+            raise TypeError("V must be a Sage matrix")
+        rows = V.dimensions()[0]
+        if rows <= 0 or V.dimensions()[1] != dim:
+            raise ValueError("V must have positive rows and the same column count as M")
+        V_terms, _ = _ring_matrix_terms(V, nP, "V", False)
+
+    if indices is None:
+        try:
+            n = len(m)
+            k_length = len(k)
+        except TypeError:
+            raise TypeError("m and k must be sized sequences when indices is omitted")
+        if k_length != n:
+            raise ValueError("m and k must have the same length")
+        index_values = list(range(n))
+    else:
+        index_values = list(indices)
+        n = len(index_values)
+
+    kbase_value = _ring_integer(kbase, "kbase")
+    if kbase_value < long_min or kbase_value > long_max:
+        raise OverflowError("kbase does not fit a C long")
+    kbase_c = int(kbase_value)
+    m_values = []
+    k_values = []
+    modulus_product = Integer(1)
+    previous_k = kbase_c
+    for position in range(n):
+        index = index_values[position]
+        m_value = _ring_integer(_ring_batch_value(m, position, index), "each modulus")
+        if m_value <= 0:
+            raise ValueError("moduli must be positive")
+        k_value = _ring_integer(_ring_batch_value(k, position, index), "each endpoint")
+        if k_value < kbase_value or (position and k_value < previous_k):
+            raise ValueError("k must be a nondecreasing sequence of endpoints not less than kbase")
+        if k_value < long_min or k_value > long_max:
+            raise OverflowError("endpoint does not fit a C long")
+        if k_value - kbase_value > long_max or k_value - previous_k > long_max:
+            raise OverflowError("endpoint span does not fit a C long")
+        m_values.append(m_value)
+        k_values.append(int(k_value))
+        modulus_product *= m_value
+        previous_k = int(k_value)
+
+    if initial_z is None:
+        initial_z_value = modulus_product
+    else:
+        initial_z_value = _ring_integer(initial_z, "z")
+        if initial_z_value <= 0:
+            raise ValueError("z must be positive")
+        if initial_z_value % modulus_product:
+            raise ValueError("z must be divisible by the product of the moduli")
+
+    if kappa is None:
+        kappa_value = 1 if n <= 1 else ceil(log(log(n, 2), 2)) + 1
+    else:
+        kappa_value = _ring_integer(kappa, "kappa")
+    if kappa_value < 0 or kappa_value > int_max:
+        raise ValueError("kappa must be a nonnegative C int")
+    if n > long_max:
+        raise OverflowError("batch size does not fit a C long")
+    if max(rows, dim, native_dim, deg, nP, int(kappa_value)) > int_max:
+        raise OverflowError("matrix dimensions, degree, precision, or kappa do not fit a C int")
+
+    matrix_cells = nP * native_dim * native_dim
+    vector_cells = nP * rows * native_dim
+    if matrix_cells > int_max or vector_cells > int_max:
+        raise OverflowError("ring matrix dimensions exceed the native C int limit")
+    M_count = matrix_cells * (deg + 1)
+    V_count = vector_cells
+    A_count = n * vector_cells
+    m_count = n
+    for count, label in ((M_count, "M"), (V_count, "V"),
+                         (A_count, "outputs"), (m_count, "moduli")):
+        _check_mpz_array_size(count, label)
+        if count > long_max:
+            raise OverflowError("%s array exceeds the native long limit" % label)
+
+    if n == 0:
+        if not return_state:
+            return {}
+        p_name = M.base_ring().variable_names()[0]
+        final_V = _ring_matrix_from_terms(V_terms, rows, dim, nP,
+                                          initial_z_value, p_name,
+                                          identity=(V_terms is None))
+        return {}, {"z": initial_z_value, "final_V": final_V}
+
+    rows_c = rows
+    dim_c = native_dim
+    deg_c = deg
+    nP_c = nP
+    n_c = n
+    kappa_c = int(kappa_value)
+    A_count_c = A_count
+    V_count_c = V_count
+    M_count_c = M_count
+    m_count_c = m_count
+
+    try:
+        M1 = <mpz_t *>malloc(M_count_c * sizeof(mpz_t))
+        V1 = <mpz_t *>malloc(V_count_c * sizeof(mpz_t))
+        m1 = <mpz_t *>malloc(m_count_c * sizeof(mpz_t))
+        k1 = <long *>malloc(m_count_c * sizeof(long))
+        A1 = <mpz_t *>malloc(A_count_c * sizeof(mpz_t))
+        if M1 == NULL or V1 == NULL or m1 == NULL or k1 == NULL or A1 == NULL:
+            raise MemoryError("unable to allocate native ring forest buffers")
+
+        for r in range(native_dim):
+            for c in range(native_dim):
+                if r < dim and c < dim:
+                    entry_terms = M_terms[r * dim + c]
+                else:
+                    entry_terms = {}
+                for p in range(nP):
+                    for d in range(deg + 1):
+                        if r == c and r >= dim:
+                            coefficient = 1 if p == 0 and d == 0 else 0
+                        else:
+                            coefficient = entry_terms.get((p, d), 0)
+                        tmp = Integer(coefficient)
+                        mpz_init_set(M1[M_initialized], tmp.value)
+                        M_initialized += 1
+
+        for p in range(nP):
+            for r in range(rows):
+                for c in range(native_dim):
+                    if V_terms is None:
+                        coefficient = 1 if p == 0 and r == c else 0
+                    elif c >= dim:
+                        coefficient = 0
+                    else:
+                        coefficient = V_terms[r * dim + c].get((p, 0), 0)
+                    tmp = Integer(coefficient)
+                    mpz_init_set(V1[V_initialized], tmp.value)
+                    V_initialized += 1
+
+        for t in range(n):
+            tmp = m_values[t]
+            mpz_init_set(m1[t], tmp.value)
+            m_initialized += 1
+            k1[t] = k_values[t]
+
+        for t in range(A_count_c):
+            mpz_init(A1[t])
+            A_initialized += 1
+        mpz_init(z)
+        z_initialized = True
+
+        sig_on()
+        try:
+            if initial_z is None:
+                tmp = modulus_product
+                mpz_set(z, tmp.value)
+            else:
+                tmp = initial_z_value
+                mpz_set(z, tmp.value)
+            if fixed_p2:
+                rforest_p2(A1, V1, rows_c, M1, deg_c, dim_c, m1,
+                           kbase_c, k1, n_c, z, kappa_c)
+            else:
+                rforest_pn(A1, V1, rows_c, M1, deg_c, dim_c, nP_c, m1,
+                           kbase_c, k1, n_c, z, kappa_c)
+        finally:
+            sig_off()
+
+        results = {}
+        p_name = M.base_ring().variable_names()[0]
+        for t in range(n):
+            output_ring = PolynomialRing(Integers(m_values[t]), p_name)
+            output_entries = []
+            for r in range(rows):
+                for c in range(dim):
+                    coefficients = []
+                    for p in range(nP):
+                        output_offset = ((t * nP + p) * rows + r) * native_dim + c
+                        tmp.set_from_mpz(A1[output_offset])
+                        coefficients.append(output_ring.base_ring()(tmp))
+                    output_entries.append(output_ring(coefficients))
+            results[index_values[t]] = Matrix(output_ring, rows, dim,
+                                              output_entries)
+
+        if not return_state:
+            return results
+
+        z_value = Integer(0)
+        z_value.set_from_mpz(z)
+        state_ring = PolynomialRing(Integers(z_value), p_name)
+        state_entries = []
+        for r in range(rows):
+            for c in range(dim):
+                coefficients = []
+                for p in range(nP):
+                    state_offset = (p * rows + r) * native_dim + c
+                    tmp.set_from_mpz(V1[state_offset])
+                    coefficients.append(state_ring.base_ring()(tmp))
+                state_entries.append(state_ring(coefficients))
+        final_V = Matrix(state_ring, rows, dim, state_entries)
+        return results, {"z": z_value, "final_V": final_V}
+
+    finally:
+        if z_initialized:
+            mpz_clear(z)
+        for t in range(M_initialized):
+            mpz_clear(M1[t])
+        if M1 != NULL:
+            free(M1)
+        for t in range(V_initialized):
+            mpz_clear(V1[t])
+        if V1 != NULL:
+            free(V1)
+        for t in range(m_initialized):
+            mpz_clear(m1[t])
+        if m1 != NULL:
+            free(m1)
+        if k1 != NULL:
+            free(k1)
+        for t in range(A_initialized):
+            mpz_clear(A1[t])
+        if A1 != NULL:
+            free(A1)
+
+
+def remainder_forest_p2(M, m, k, kbase=0, indices=None, V=None,
+                        kappa=None, return_state=False, *, z=None):
+    r"""Compute a remainder forest over the truncated formal ring ``ZZ[P]/(P^2)``.
+
+    ``M`` is a square Sage matrix over an exact two-generator integer
+    polynomial ring. Its first generator is formal ``P`` and its second is
+    transition variable ``x``, regardless of their Sage names. ``x`` is
+    evaluated at each transition index; ``P`` remains formal and is truncated
+    modulo ``P^2``. ``V`` may be a rectangular matrix over ``ZZ``, a
+    one-generator integer polynomial ring (whose generator is formal ``P``),
+    or the same two-generator ring, and must be independent of ``x``. Each output is
+    a Sage matrix over ``(ZZ/m[i]ZZ)[P]`` with only the coefficients of 1 and
+    P retained. The usual ``m``, ``k``, ``indices``, ``kbase`` and ``kappa``
+    conventions of :func:`remainder_forest` apply, including exclusive
+    endpoints and right multiplication.
+
+    If ``return_state`` is true, return ``(results, state)`` where the state
+    dict has keys ``'z'`` (the exact residual modulus) and ``'final_V'`` (the
+    final ``V`` modulo that modulus).
+    The keyword-only ``z`` may provide an initial positive multiple of all
+    endpoint moduli; by default it is their product, so the residual modulus
+    is one and ``final_V`` is zero in the modulus-one ring.
+    """
+    return _remainder_forest_ring(M, m, k, 2, kbase, indices, V, kappa,
+                                  return_state, True, z)
+
+
+def remainder_forest_pn(M, m, k, nP, kbase=0, indices=None, V=None,
+                        kappa=None, return_state=False, *, z=None):
+    r"""Compute a remainder forest over the truncated formal ring ``ZZ[P]/(P^nP)``.
+
+    ``M`` and ``V`` use the exact coefficient and transition-variable contract
+    documented by :func:`remainder_forest_p2`. ``nP`` is an integer at least
+    one. Each output is a Sage matrix over ``(ZZ/m[i]ZZ)[P]`` truncated to
+    exponents below ``nP``. With ``return_state=True``, the return value is
+    ``(results, state)`` where the state dict has keys ``'z'`` and ``'final_V'``.
+    The keyword-only ``z`` has the same initial-modulus meaning as in
+    :func:`remainder_forest_p2`.
+    """
+    return _remainder_forest_ring(M, m, k, nP, kbase, indices, V, kappa,
+                                  return_state, False, z)
 
 def inflate_matrix(M, vars, e):
     """

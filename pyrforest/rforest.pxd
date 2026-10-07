@@ -15,3 +15,11 @@ cdef extern from "<rforest.h>":
                   long n,     # number of moduli and rows*dim outputs
                   mpz_t z,    # integer divisible by product of the moduli
                   int kappa)  # log_2 of number of trees in the forest
+
+    void rforest_p2 (mpz_t *A, mpz_t *V, int rows, mpz_t *M, int deg,
+                     int dim, mpz_t *m, long kbase, long *k, long n,
+                     mpz_t z, int kappa)
+
+    void rforest_pn (mpz_t *A, mpz_t *V, int rows, mpz_t *M, int deg,
+                     int dim, int nP, mpz_t *m, long kbase, long *k,
+                     long n, mpz_t z, int kappa)
