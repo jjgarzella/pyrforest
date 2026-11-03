@@ -49,7 +49,11 @@ Import Sage before importing `pyrforest`:
 
 ```
 from sage.all import Matrix, PolynomialRing, ZZ
-from pyrforest import remainder_forest_p2, remainder_forest_pn
+from pyrforest import (
+    remainder_forest_p2,
+    remainder_forest_p2_packed,
+    remainder_forest_pn,
+)
 ```
 
 Run the wrapper doctests, independent ring-binding references, and native
@@ -65,6 +69,7 @@ make -C pyrforest/lib check
 ### Interface with rforest
 #### remainder_forest(M, m, k, kbase=0, indices=None, V=None, ans=None, kappa=None, projective=False)
 #### remainder_forest_p2(M, m, k, kbase=0, indices=None, V=None, kappa=None, return_state=False, *, z=None)
+#### remainder_forest_p2_packed(M, primes, kbase=0, indices=None, V=None, kappa=None)
 #### remainder_forest_pn(M, m, k, nP, kbase=0, indices=None, V=None, kappa=None, return_state=False, *, z=None)
 #### remainder_forest_generic_prime(M, d, e, k, indices=None, m=None, kbase=0, V=None, ans=None, kappa=None)
 
@@ -76,6 +81,37 @@ evaluated at each transition index; `P` remains formal.
 `remainder_forest_pn` takes an explicit positive `nP` and retains powers below
 `P^nP` (the powers `0` through `nP-1`). Coefficients at higher P powers are
 truncated before the native call.
+
+`remainder_forest_p2_packed` is an explicit opt-in output path for prime
+moduli `p^2`, with endpoint `k=p`. It accepts primes `2 <= p <= 2^32-1` in
+nondecreasing order and rejects composites or values outside that range with
+`PackedP2UnsupportedDomain`. Catch that exception when a consumer needs to
+fall back to the arbitrary-precision `remainder_forest_p2` interface. The
+ordinary Sage matrix functions keep their existing result type and behavior.
+
+The packed result has logical shape `(batch, 2, rows, columns)`: for each
+prime, plane 0 contains `P^0`, plane 1 contains `P^1`, and each matrix plane is
+row-major. `result.primes`, `result.endpoints`, `result.moduli`, and
+`result.indices` retain the exact input order. `result.coefficients` is a
+read-only flat memoryview with format `Q` (native-endian uint64); the linear
+index is `(((batch_position*2 + plane)*rows + row)*columns + column)`.
+`result.matrix(batch_position, plane)` returns one shaped read-only matrix
+view, and `result.buffer` exposes the immutable bytes that own the copy.
+Every coefficient is checked to lie in `[0, p^2)` before export.
+
+For Trace inputs, the same function can be used for each matrix and the scalar
+call, with `V` omitted for the identity matrix:
+
+```python
+packed = remainder_forest_p2_packed(M, primes, kbase=1)
+trace_plane_0 = packed.matrix(0, 0)
+trace_plane_1 = packed.matrix(0, 1)
+```
+
+The buffer remains valid after the native forest temporaries are released and
+after later calls. The export traverses native GMP coefficients in compiled
+code and does not construct intermediate Sage result matrices or polynomial
+coefficients.
 
 The initial `V` may be rectangular. It can use exact integer constants, a
 one-generator integer polynomial ring (whose generator is formal `P`), or

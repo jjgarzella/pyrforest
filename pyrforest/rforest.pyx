@@ -13,13 +13,18 @@ and `k_i` and `m_i` are sequences of integers.
 
 from cython cimport sizeof
 from cysignals.signals cimport sig_on, sig_off
+from cpython.bytes cimport PyBytes_FromStringAndSize
 from libc.stddef cimport size_t
+from libc.stdint cimport uint64_t
 from libc.stdlib cimport malloc, free
 from sage.libs.gmp.mpz cimport (
     mpz_clear,
+    mpz_cmp,
+    mpz_export,
     mpz_init,
     mpz_init_set,
     mpz_init_set_ui,
+    mpz_sgn,
     mpz_set,
 )
 from sage.combinat.integer_vector import IntegerVectors
@@ -32,6 +37,83 @@ from sage.rings.finite_rings.integer_mod_ring import Integers
 from sage.rings.polynomial.laurent_polynomial_ring_base import LaurentPolynomialRing_generic
 from sage.rings.polynomial.polynomial_ring_constructor import PolynomialRing
 
+
+
+PACKED_P2_UINT64_CAPABILITY = 1
+
+
+class PackedP2UnsupportedDomain(ValueError):
+    """The packed P² API cannot represent the requested prime domain."""
+
+
+cdef class PackedP2ForestResult:
+    """Immutable owner of row-major P⁰/P¹ uint64 forest output."""
+
+    cdef object _buffer
+    cdef readonly object primes
+    cdef readonly object indices
+    cdef readonly object endpoints
+    cdef readonly object moduli
+    cdef readonly int rows
+    cdef readonly int columns
+
+    def __cinit__(self, object buffer, object primes, object indices,
+                  object endpoints, object moduli, int rows, int columns):
+        if not isinstance(buffer, bytes):
+            raise TypeError("packed result storage must be immutable bytes")
+        if len(buffer) != len(primes) * 2 * rows * columns * 8:
+            raise ValueError("packed result storage does not match its shape")
+        self._buffer = buffer
+        self.primes = primes
+        self.indices = indices
+        self.endpoints = endpoints
+        self.moduli = moduli
+        self.rows = rows
+        self.columns = columns
+
+    @property
+    def buffer(self):
+        """Immutable native-endian bytes backing the machine-word view."""
+        return self._buffer
+
+    @property
+    def coefficients(self):
+        """Read-only flat memoryview with format ``Q`` (uint64)."""
+        return memoryview(self._buffer).cast("Q")
+
+    @property
+    def shape(self):
+        """Logical shape ``(batch, 2, rows, columns)``."""
+        return (len(self.primes), 2, self.rows, self.columns)
+
+    @property
+    def plane_names(self):
+        return ("P^0", "P^1")
+
+    def matrix(self, batch_position, plane):
+        """Return one read-only row-major ``(rows, columns)`` plane view."""
+        batch_position = int(batch_position)
+        plane = int(plane)
+        if batch_position < 0 or batch_position >= len(self.primes):
+            raise IndexError("packed result batch position is out of range")
+        if plane not in (0, 1):
+            raise IndexError("packed P² plane must be 0 or 1")
+        cells = self.rows * self.columns
+        first = (batch_position * 2 + plane) * cells * 8
+        last = first + cells * 8
+        return memoryview(self._buffer)[first:last].cast(
+            "Q", shape=(self.rows, self.columns)
+        )
+
+    def __repr__(self):
+        return "PackedP2ForestResult(primes=%d, shape=%r, readonly=True)" % (
+            len(self.primes), self.shape
+        )
+
+
+def _construct_packed_p2_result(*args):
+    """Private construction seam used to exercise post-native cleanup."""
+    return PackedP2ForestResult(*args)
 
 
 cpdef remainder_forest(M, m, k, kbase=0, indices=None, V=None, ans=None, kappa=None,  cutoff=None, projective=False):
@@ -373,24 +455,29 @@ def _ring_matrix_from_terms(terms, rows, dim, nP, modulus, p_name,
 
 def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
                            kappa=None, return_state=False, fixed_p2=False,
-                           initial_z=None):
+                           initial_z=None, packed_p2=False):
     """Shared safe marshalling layer for the native P² and P^n forests."""
     cdef mpz_t *A1 = NULL
     cdef mpz_t *V1 = NULL
     cdef mpz_t *M1 = NULL
     cdef mpz_t *m1 = NULL
     cdef long *k1 = NULL
+    cdef uint64_t *packed_words = NULL
     cdef mpz_t z
     cdef Integer tmp
+    cdef Integer prime_value
     cdef size_t A_initialized = 0
     cdef size_t V_initialized = 0
     cdef size_t M_initialized = 0
     cdef size_t m_initialized = 0
+    cdef size_t packed_count_c = 0
+    cdef size_t exported_words = 0
     cdef bint z_initialized = False
     cdef int rows_c, dim_c, deg_c, nP_c, kappa_c
     cdef long n_c, kbase_c
     cdef size_t A_count_c, V_count_c, M_count_c, m_count_c
-    cdef size_t t, r, c, p, d
+    cdef Py_ssize_t packed_nbytes_c = 0
+    cdef size_t t, r, c, p, d, packed_offset
 
     precision = _ring_integer(nP, "nP")
     if precision < 1:
@@ -401,6 +488,8 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
     long_max = -long_min - 1
     if nP > int_max:
         raise OverflowError("nP does not fit a C int")
+    if packed_p2 and (not fixed_p2 or nP != 2):
+        raise ValueError("packed output is available only for the fixed P² forest")
 
     if not hasattr(M, "is_square") or not M.is_square():
         raise ValueError("M must be a square Sage matrix")
@@ -424,10 +513,13 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
     if indices is None:
         try:
             n = len(m)
-            k_length = len(k)
+            if not packed_p2:
+                k_length = len(k)
         except TypeError:
+            if packed_p2:
+                raise TypeError("primes must be a sized sequence when indices is omitted")
             raise TypeError("m and k must be sized sequences when indices is omitted")
-        if k_length != n:
+        if not packed_p2 and k_length != n:
             raise ValueError("m and k must have the same length")
         index_values = list(range(n))
     else:
@@ -440,14 +532,32 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
     kbase_c = int(kbase_value)
     m_values = []
     k_values = []
+    prime_values = []
     modulus_product = Integer(1)
     previous_k = kbase_c
     for position in range(n):
         index = index_values[position]
-        m_value = _ring_integer(_ring_batch_value(m, position, index), "each modulus")
-        if m_value <= 0:
-            raise ValueError("moduli must be positive")
-        k_value = _ring_integer(_ring_batch_value(k, position, index), "each endpoint")
+        if packed_p2:
+            prime_value = _ring_integer(
+                _ring_batch_value(m, position, index), "each prime"
+            )
+            if (prime_value < 2 or prime_value > Integer(2) ** 32 - 1
+                    or not prime_value.is_prime(proof=True)):
+                raise PackedP2UnsupportedDomain(
+                    "packed P² output requires primes in the uint32 domain"
+                )
+            prime_values.append(prime_value)
+            m_value = prime_value * prime_value
+            k_value = prime_value
+        else:
+            m_value = _ring_integer(
+                _ring_batch_value(m, position, index), "each modulus"
+            )
+            if m_value <= 0:
+                raise ValueError("moduli must be positive")
+            k_value = _ring_integer(
+                _ring_batch_value(k, position, index), "each endpoint"
+            )
         if k_value < kbase_value or (position and k_value < previous_k):
             raise ValueError("k must be a nondecreasing sequence of endpoints not less than kbase")
         if k_value < long_min or k_value > long_max:
@@ -493,7 +603,19 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
         if count > long_max:
             raise OverflowError("%s array exceeds the native long limit" % label)
 
+    if packed_p2:
+        packed_count = n * 2 * rows * dim
+        py_ssize_max = Integer(2) ** (8 * sizeof(Py_ssize_t) - 1) - 1
+        if packed_count > py_ssize_max // sizeof(uint64_t):
+            raise OverflowError("packed output is too large for a Python buffer")
+        packed_count_c = <size_t>packed_count
+        packed_nbytes_c = <Py_ssize_t>(packed_count_c * sizeof(uint64_t))
+
     if n == 0:
+        if packed_p2:
+            return PackedP2ForestResult(
+                b"", tuple(), tuple(index_values), tuple(), tuple(), rows, dim
+            )
         if not return_state:
             return {}
         p_name = M.base_ring().variable_names()[0]
@@ -521,6 +643,12 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
         A1 = <mpz_t *>malloc(A_count_c * sizeof(mpz_t))
         if M1 == NULL or V1 == NULL or m1 == NULL or k1 == NULL or A1 == NULL:
             raise MemoryError("unable to allocate native ring forest buffers")
+        if packed_p2 and packed_count_c:
+            packed_words = <uint64_t *>malloc(
+                packed_count_c * sizeof(uint64_t)
+            )
+            if packed_words == NULL:
+                raise MemoryError("unable to allocate packed uint64 output buffer")
 
         for r in range(native_dim):
             for c in range(native_dim):
@@ -580,6 +708,43 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
         finally:
             sig_off()
 
+        if packed_p2:
+            packed_offset = 0
+            for t in range(n):
+                for p in range(2):
+                    for r in range(rows):
+                        for c in range(dim):
+                            output_offset = ((t * 2 + p) * rows + r) * native_dim + c
+                            if (mpz_sgn(A1[output_offset]) < 0
+                                    or mpz_cmp(A1[output_offset], m1[t]) >= 0):
+                                raise ArithmeticError(
+                                    "native P² output is not canonical modulo p²"
+                                )
+                            packed_words[packed_offset] = 0
+                            exported_words = 0
+                            mpz_export(
+                                &packed_words[packed_offset], &exported_words,
+                                -1, sizeof(uint64_t), 0, 0, A1[output_offset]
+                            )
+                            if exported_words > 1:
+                                raise OverflowError(
+                                    "canonical P² coefficient does not fit uint64"
+                                )
+                            packed_offset += 1
+            packed_raw = PyBytes_FromStringAndSize(
+                <char *>packed_words, packed_nbytes_c
+            )
+            packed_result_factory = globals()["_construct_packed_p2_result"]
+            return packed_result_factory(
+                packed_raw,
+                tuple(int(value) for value in prime_values),
+                tuple(index_values),
+                tuple(k_values),
+                tuple(int(value) for value in m_values),
+                rows,
+                dim,
+            )
+
         results = {}
         p_name = M.base_ring().variable_names()[0]
         for t in range(n):
@@ -635,6 +800,8 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
             mpz_clear(A1[t])
         if A1 != NULL:
             free(A1)
+        if packed_words != NULL:
+            free(packed_words)
 
 
 def remainder_forest_p2(M, m, k, kbase=0, indices=None, V=None,
@@ -662,6 +829,50 @@ def remainder_forest_p2(M, m, k, kbase=0, indices=None, V=None,
     """
     return _remainder_forest_ring(M, m, k, 2, kbase, indices, V, kappa,
                                   return_state, True, z)
+
+
+def remainder_forest_p2_packed(M, primes, kbase=0, indices=None, V=None,
+                               kappa=None):
+    r"""Return a packed P² forest for primes in the uint32 range.
+
+    For each prime ``p``, compute ``V*M(kbase)*...*M(p-1)`` modulo ``p^2``
+    with formal ``P^2 = 0``. The input matrix and optional rectangular ``V``
+    follow :func:`remainder_forest_p2`; when ``V`` is omitted the identity is
+    used. ``primes`` may be a sized sequence, dict, or callable, following the
+    existing batch conventions. With ``indices``, those keys are visited and
+    retained in exactly that order. Since the native forest requires
+    nondecreasing endpoints, the corresponding prime values must also be
+    nondecreasing.
+
+    Each result is a :class:`PackedP2ForestResult`. Its immutable native-endian
+    ``uint64`` buffer has logical shape ``(batch, 2, rows, columns)``. The
+    planes are ordered ``P^0`` then ``P^1`` and each plane is row-major. The
+    flat read-only ``coefficients`` memoryview uses format ``Q``; its linear
+    index is ``(((batch_position*2 + plane)*rows + row)*columns + column)``.
+    The ``primes``, ``endpoints``, and ``moduli`` tuples retain input order,
+    with endpoints ``p`` and moduli ``p^2``. Each coefficient is checked to be
+    canonical in ``[0,p^2)`` before checked GMP export. The bytes own a copy,
+    so they remain valid after native temporaries are freed and after later
+    forest calls.
+
+    Raises :class:`PackedP2UnsupportedDomain` if a value is composite or
+    outside ``2 <= p <= 2^32-1``. A consumer can catch that exception and use
+    :func:`remainder_forest_p2` for its arbitrary-precision fallback.
+    """
+    return _remainder_forest_ring(
+        M,
+        primes,
+        None,
+        2,
+        kbase=kbase,
+        indices=indices,
+        V=V,
+        kappa=kappa,
+        return_state=False,
+        fixed_p2=True,
+        initial_z=None,
+        packed_p2=True,
+    )
 
 
 def remainder_forest_pn(M, m, k, nP, kbase=0, indices=None, V=None,

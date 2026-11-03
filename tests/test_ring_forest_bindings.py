@@ -1,10 +1,19 @@
 """Independent Sage references for the native P² and P^n wrappers."""
 
+import gc
 from pathlib import Path
 
 from sage.all import Integers, LaurentPolynomialRing, Matrix, PolynomialRing, QQ, ZZ, prod
 
-from pyrforest import remainder_forest, remainder_forest_p2, remainder_forest_pn
+from pyrforest import (
+    PACKED_P2_UINT64_CAPABILITY,
+    PackedP2ForestResult,
+    PackedP2UnsupportedDomain,
+    remainder_forest,
+    remainder_forest_p2,
+    remainder_forest_p2_packed,
+    remainder_forest_pn,
+)
 from pyrforest.rforest import deflate_matrix, inflate_matrix
 import pyrforest.rforest as binding_module
 
@@ -99,6 +108,38 @@ def assert_raises(error_type, function):
     except error_type:
         return
     raise AssertionError("expected %s" % error_type.__name__)
+
+
+def assert_packed_equals(packed, expected, primes, indices=None):
+    if indices is None:
+        indices = tuple(range(len(primes)))
+    else:
+        indices = tuple(indices)
+    rows = next(iter(expected.values())).nrows()
+    columns = next(iter(expected.values())).ncols()
+    assert isinstance(packed, PackedP2ForestResult)
+    assert packed.shape == (len(primes), 2, rows, columns)
+    assert packed.indices == indices
+    assert packed.primes == tuple(primes)
+    assert packed.endpoints == tuple(primes)
+    assert packed.moduli == tuple(p * p for p in primes)
+    assert packed.plane_names == ("P^0", "P^1")
+    flat = packed.coefficients
+    assert flat.format == "Q" and flat.itemsize == 8
+    assert flat.readonly and flat.c_contiguous
+    assert len(flat) == len(primes) * 2 * rows * columns
+    for batch_position, index in enumerate(indices):
+        for plane in range(2):
+            matrix = packed.matrix(batch_position, plane)
+            assert tuple(matrix.shape) == (rows, columns)
+            assert matrix.format == "Q" and matrix.readonly
+            for row in range(rows):
+                for column in range(columns):
+                    expected_value = int(expected[index][row, column][plane])
+                    assert matrix[row, column] == expected_value
+                    offset = (((batch_position * 2 + plane) * rows + row)
+                              * columns + column)
+                    assert flat[offset] == expected_value
 
 
 def main():
@@ -342,7 +383,199 @@ def main():
 
     assert remainder_forest_pn(M, [5], [1], 2) == direct_ring_forest(M, [5], [1], 2)
 
-    print("PASS exact P²/P^n wrapper references, state, signed endpoints, and validation")
+    # The explicit packed P² route preserves prime order and avoids Sage
+    # result-ring/matrix construction while retaining the legacy output API.
+    assert PACKED_P2_UINT64_CAPABILITY == 1
+    packed_primes = [5, 7, 11, 13]
+    packed_moduli = [prime**2 for prime in packed_primes]
+    packed_expected = direct_ring_forest(
+        M, packed_moduli, packed_primes, 2, kbase, V
+    )
+    for packed_kappa in (0, 1, 3):
+        legacy = remainder_forest_p2(
+            M, packed_moduli, packed_primes,
+            kbase=kbase, V=V, kappa=packed_kappa,
+        )
+        packed = remainder_forest_p2_packed(
+            M, packed_primes, kbase=kbase, V=V, kappa=packed_kappa
+        )
+        assert legacy == packed_expected
+        assert_packed_equals(packed, packed_expected, packed_primes)
+
+    keyed_primes = {"g2": 5, "g3": 7, "g4": 11}
+    keyed_order = ("g2", "g3", "g4")
+    keyed_reference = direct_ring_forest(
+        M, [25, 49, 121], [5, 7, 11], 2, kbase, V
+    )
+    keyed_expected_packed = {
+        key: keyed_reference[position]
+        for position, key in enumerate(keyed_order)
+    }
+    keyed_packed = remainder_forest_p2_packed(
+        M, keyed_primes, kbase=kbase, indices=keyed_order, V=V, kappa=1
+    )
+    assert_packed_equals(
+        keyed_packed, keyed_expected_packed, [5, 7, 11], keyed_order
+    )
+
+    # A nonsymmetric 3x3 matrix exercises row-major planes across a second
+    # size and uses independent sequential products as the reference.
+    M3 = Matrix(
+        S,
+        [
+            [x + P - 2, 2*x - 3*P, -3 + P*x],
+            [1 + 2*P, x**2 - 4, 5 - P],
+            [x - P, 2 + P*x, 3*x + 1],
+        ],
+    )
+    M3_before = M3.__copy__()
+    primes3 = [3, 5]
+    expected3 = direct_ring_forest(
+        M3, [p*p for p in primes3], primes3, 2, kbase=1
+    )
+    for packed_kappa in (0, 2):
+        actual3 = remainder_forest_p2_packed(
+            M3, primes3, kbase=1, kappa=packed_kappa
+        )
+        assert_packed_equals(actual3, expected3, primes3)
+    assert M3 == M3_before
+
+    scalar_M = Matrix(S, [[-7 + 3*P + x]])
+    scalar_primes = [2, 3, 5]
+    scalar_expected = direct_ring_forest(
+        scalar_M, [p*p for p in scalar_primes], scalar_primes, 2, kbase=1
+    )
+    scalar_packed = remainder_forest_p2_packed(
+        scalar_M, scalar_primes, kbase=1, kappa=0
+    )
+    assert_packed_equals(scalar_packed, scalar_expected, scalar_primes)
+
+    empty_packed = remainder_forest_p2_packed(M, [], V=V)
+    assert empty_packed.shape == (0, 2, 1, 2)
+    assert empty_packed.primes == empty_packed.endpoints == empty_packed.moduli == ()
+    assert empty_packed.indices == ()
+    assert empty_packed.coefficients.format == "Q"
+    assert len(empty_packed.coefficients) == 0
+
+    # The largest 32-bit prime produces coefficients above signed-long range.
+    # One transition is enough to verify checked uint64 export at the boundary.
+    largest_u32_prime = 4294967291
+    largest_u32_square = largest_u32_prime**2
+    boundary_M = Matrix(
+        S, [[largest_u32_square - 1 + (largest_u32_square - 2)*P]]
+    )
+    boundary_expected = direct_ring_forest(
+        boundary_M,
+        [largest_u32_square],
+        [largest_u32_prime],
+        2,
+        kbase=largest_u32_prime - 1,
+    )
+    boundary_packed = remainder_forest_p2_packed(
+        boundary_M,
+        [largest_u32_prime],
+        kbase=largest_u32_prime - 1,
+        kappa=0,
+    )
+    assert_packed_equals(
+        boundary_packed, boundary_expected, [largest_u32_prime]
+    )
+    assert boundary_packed.matrix(0, 0)[0, 0] == largest_u32_square - 1
+    assert boundary_packed.matrix(0, 1)[0, 0] == largest_u32_square - 2
+    assert boundary_packed.matrix(0, 0)[0, 0] > 2**63
+    assert boundary_packed.matrix(0, 1)[0, 0] > 2**63
+
+    # Memoryviews retain the immutable byte owner after the result object and
+    # native arrays are gone, and a later call cannot mutate older results.
+    held = remainder_forest_p2_packed(M, [5], kbase=kbase, V=V, kappa=1)
+    held_buffer = held.buffer
+    held_view = held.matrix(0, 1)
+    held_values = tuple(held_view[r, c] for r in range(held.rows)
+                        for c in range(held.columns))
+    del held
+    gc.collect()
+    later = remainder_forest_p2_packed(M, [7], kbase=kbase, V=V, kappa=1)
+    assert later.buffer is not held_buffer
+    assert tuple(held_view[r, c] for r in range(1) for c in range(2)) == held_values
+
+    # Positive control: the legacy path calls Sage result constructors; the
+    # packed path calls none of them after its Sage inputs already exist.
+    constructor_counts = {"Matrix": 0, "Integers": 0, "PolynomialRing": 0}
+    constructors = {
+        name: getattr(binding_module, name) for name in constructor_counts
+    }
+
+    def observe_constructor(name):
+        original = constructors[name]
+
+        def observed(*args, **kwargs):
+            constructor_counts[name] += 1
+            return original(*args, **kwargs)
+
+        return observed
+
+    for name in constructor_counts:
+        setattr(binding_module, name, observe_constructor(name))
+    try:
+        legacy_probe = remainder_forest_p2(
+            M, [25], [5], kbase=kbase, V=V, kappa=1
+        )
+        assert legacy_probe
+        assert constructor_counts["Matrix"] > 0
+        assert constructor_counts["Integers"] > 0
+        assert constructor_counts["PolynomialRing"] > 0
+        for name in constructor_counts:
+            constructor_counts[name] = 0
+        packed_probe = remainder_forest_p2_packed(
+            M, [5], kbase=kbase, V=V, kappa=1
+        )
+        assert all(count == 0 for count in constructor_counts.values())
+    finally:
+        for name, constructor in constructors.items():
+            setattr(binding_module, name, constructor)
+    assert_packed_equals(packed_probe, {0: packed_expected[0]}, [5])
+
+    # A post-native result-construction exception exercises cleanup of GMP and
+    # packed allocations; the next call must remain independent and usable.
+    original_result_factory = binding_module._construct_packed_p2_result
+
+    def reject_result_construction(*args, **kwargs):
+        raise RuntimeError("injected packed result construction failure")
+
+    binding_module._construct_packed_p2_result = reject_result_construction
+    try:
+        assert_raises(
+            RuntimeError,
+            lambda: remainder_forest_p2_packed(M, [5], kbase=kbase, V=V),
+        )
+    finally:
+        binding_module._construct_packed_p2_result = original_result_factory
+    after_failure = remainder_forest_p2_packed(
+        M, [5], kbase=kbase, V=V, kappa=1
+    )
+    assert_packed_equals(after_failure, {0: packed_expected[0]}, [5])
+
+    for invalid_prime in (1, 9, 2**32 - 1, 2**32):
+        assert_raises(
+            PackedP2UnsupportedDomain,
+            lambda invalid_prime=invalid_prime: remainder_forest_p2_packed(
+                M, [invalid_prime], kbase=kbase, V=V
+            ),
+        )
+    assert_raises(
+        TypeError,
+        lambda: remainder_forest_p2_packed(M, [True], kbase=kbase, V=V),
+    )
+    assert_raises(
+        ValueError,
+        lambda: remainder_forest_p2_packed(M, [7, 5], kbase=kbase, V=V),
+    )
+
+    assert M == M_before and V == V_before
+    print(
+        "PASS exact P²/P^n references and packed uint64 planes, ownership, "
+        "bypass, and validation"
+    )
 
 
 if __name__ == "__main__":
