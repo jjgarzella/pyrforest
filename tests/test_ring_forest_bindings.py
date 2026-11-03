@@ -1,6 +1,7 @@
 """Independent Sage references for the native P² and P^n wrappers."""
 
 import gc
+import ctypes
 from pathlib import Path
 
 from sage.all import Integers, LaurentPolynomialRing, Matrix, PolynomialRing, QQ, ZZ, prod
@@ -457,45 +458,128 @@ def main():
     assert empty_packed.coefficients.format == "Q"
     assert len(empty_packed.coefficients) == 0
 
-    # The largest 32-bit prime produces coefficients above signed-long range.
-    # One transition is enough to verify checked uint64 export at the boundary.
+    # Public result construction snapshots metadata and rejects malformed
+    # shapes before creating an object that a Cython consumer could misread.
+    mutable_primes = [5]
+    mutable_indices = ["g2"]
+    mutable_endpoints = [5]
+    mutable_moduli = [25]
+    directly_constructed = PackedP2ForestResult(
+        bytes(16), mutable_primes, mutable_indices,
+        mutable_endpoints, mutable_moduli, 1, 1,
+    )
+    mutable_primes.append(7)
+    mutable_indices.append("g3")
+    mutable_endpoints.append(7)
+    mutable_moduli.append(49)
+    assert directly_constructed.shape == (1, 2, 1, 1)
+    assert directly_constructed.primes == (5,)
+    assert directly_constructed.indices == ("g2",)
+    assert directly_constructed.endpoints == (5,)
+    assert directly_constructed.moduli == (25,)
+    assert directly_constructed.coefficients.format == "Q"
+    assert directly_constructed.coefficients.readonly
+
+    direct_empty = PackedP2ForestResult(b"", [], [], [], [], 1, 1)
+    assert direct_empty.shape == (0, 2, 1, 1)
+    assert len(direct_empty.coefficients) == 0
+    for invalid_rows, invalid_columns in ((-1, -1), (-1, 1), (1, -1),
+                                          (0, 1), (1, 0)):
+        assert_raises(
+            ValueError,
+            lambda invalid_rows=invalid_rows, invalid_columns=invalid_columns:
+                PackedP2ForestResult(
+                    bytes(16), [5], [0], [5], [25],
+                    invalid_rows, invalid_columns,
+                ),
+        )
+    assert_raises(
+        ValueError,
+        lambda: PackedP2ForestResult(bytes(16), [5], [], [5], [25], 1, 1),
+    )
+    assert_raises(
+        ValueError,
+        lambda: PackedP2ForestResult(bytes(15), [5], [0], [5], [25], 1, 1),
+    )
+    assert_raises(
+        PackedP2UnsupportedDomain,
+        lambda: PackedP2ForestResult(bytes(16), [9], [0], [9], [81], 1, 1),
+    )
+    c_int_max = 2 ** (8 * ctypes.sizeof(ctypes.c_int) - 1) - 1
+    assert_raises(
+        OverflowError,
+        lambda: PackedP2ForestResult(
+            b"", [5], [0], [5], [25], c_int_max, c_int_max
+        ),
+    )
+
+    # The endpoint cap is the minimum of uint32 and the native signed-C-long
+    # limit. Artificial width probes cover the 32-bit boundary without
+    # pretending that a 32-bit build was run on this host.
+    assert int(binding_module._packed_p2_endpoint_limit(4)) == 2**31 - 1
+    assert binding_module._packed_p2_endpoint_supported(2**31 - 1, 4)
+    assert not binding_module._packed_p2_endpoint_supported(2**31, 4)
+    assert int(binding_module._packed_p2_endpoint_limit(8)) == 2**32 - 1
+    assert binding_module._packed_p2_endpoint_supported(2**32 - 1, 8)
+    assert not binding_module._packed_p2_endpoint_supported(2**32, 8)
+    host_long_size = ctypes.sizeof(ctypes.c_long)
+    host_endpoint_limit = int(
+        binding_module._packed_p2_endpoint_limit(host_long_size)
+    )
+    assert binding_module._packed_p2_endpoint_supported(
+        host_endpoint_limit, host_long_size
+    )
+    assert not binding_module._packed_p2_endpoint_supported(
+        host_endpoint_limit + 1, host_long_size
+    )
+
+    # On a 64-bit-long host, the largest uint32 prime produces coefficients
+    # above signed-long range. One transition verifies checked uint64 export.
     largest_u32_prime = 4294967291
-    largest_u32_square = largest_u32_prime**2
-    boundary_M = Matrix(
-        S, [[largest_u32_square - 1 + (largest_u32_square - 2)*P]]
-    )
-    boundary_expected = direct_ring_forest(
-        boundary_M,
-        [largest_u32_square],
-        [largest_u32_prime],
-        2,
-        kbase=largest_u32_prime - 1,
-    )
-    boundary_packed = remainder_forest_p2_packed(
-        boundary_M,
-        [largest_u32_prime],
-        kbase=largest_u32_prime - 1,
-        kappa=0,
-    )
-    assert_packed_equals(
-        boundary_packed, boundary_expected, [largest_u32_prime]
-    )
-    assert boundary_packed.matrix(0, 0)[0, 0] == largest_u32_square - 1
-    assert boundary_packed.matrix(0, 1)[0, 0] == largest_u32_square - 2
-    assert boundary_packed.matrix(0, 0)[0, 0] > 2**63
-    assert boundary_packed.matrix(0, 1)[0, 0] > 2**63
+    if binding_module._packed_p2_endpoint_supported(
+            largest_u32_prime, host_long_size):
+        largest_u32_square = largest_u32_prime**2
+        boundary_M = Matrix(
+            S, [[largest_u32_square - 1 + (largest_u32_square - 2)*P]]
+        )
+        boundary_expected = direct_ring_forest(
+            boundary_M,
+            [largest_u32_square],
+            [largest_u32_prime],
+            2,
+            kbase=largest_u32_prime - 1,
+        )
+        boundary_packed = remainder_forest_p2_packed(
+            boundary_M,
+            [largest_u32_prime],
+            kbase=largest_u32_prime - 1,
+            kappa=0,
+        )
+        assert_packed_equals(
+            boundary_packed, boundary_expected, [largest_u32_prime]
+        )
+        assert boundary_packed.matrix(0, 0)[0, 0] == largest_u32_square - 1
+        assert boundary_packed.matrix(0, 1)[0, 0] == largest_u32_square - 2
+        assert boundary_packed.matrix(0, 0)[0, 0] > 2**63
+        assert boundary_packed.matrix(0, 1)[0, 0] > 2**63
+    else:
+        assert_raises(
+            PackedP2UnsupportedDomain,
+            lambda: remainder_forest_p2_packed(
+                M, [largest_u32_prime], kbase=0, V=V, kappa=0
+            ),
+        )
 
     # Memoryviews retain the immutable byte owner after the result object and
     # native arrays are gone, and a later call cannot mutate older results.
     held = remainder_forest_p2_packed(M, [5], kbase=kbase, V=V, kappa=1)
-    held_buffer = held.buffer
     held_view = held.matrix(0, 1)
     held_values = tuple(held_view[r, c] for r in range(held.rows)
                         for c in range(held.columns))
     del held
     gc.collect()
+    assert tuple(held_view[r, c] for r in range(1) for c in range(2)) == held_values
     later = remainder_forest_p2_packed(M, [7], kbase=kbase, V=V, kappa=1)
-    assert later.buffer is not held_buffer
     assert tuple(held_view[r, c] for r in range(1) for c in range(2)) == held_values
 
     # Positive control: the legacy path calls Sage result constructors; the

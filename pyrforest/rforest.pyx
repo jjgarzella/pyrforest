@@ -46,8 +46,15 @@ class PackedP2UnsupportedDomain(ValueError):
     """The packed P² API cannot represent the requested prime domain."""
 
 
+cdef object _PACKED_P2_RESULT_TOKEN = object()
+
+
 cdef class PackedP2ForestResult:
-    """Immutable owner of row-major P⁰/P¹ uint64 forest output."""
+    """Immutable owner of a validated row-major P⁰/P¹ uint64 result.
+
+    Metadata sequences are copied to tuples. Direct construction validates
+    their alignment, prime domain, positive dimensions, and byte size.
+    """
 
     cdef object _buffer
     cdef readonly object primes
@@ -58,18 +65,81 @@ cdef class PackedP2ForestResult:
     cdef readonly int columns
 
     def __cinit__(self, object buffer, object primes, object indices,
-                  object endpoints, object moduli, int rows, int columns):
+                  object endpoints, object moduli, object rows, object columns,
+                  object construction_token=None):
         if not isinstance(buffer, bytes):
             raise TypeError("packed result storage must be immutable bytes")
-        if len(buffer) != len(primes) * 2 * rows * columns * 8:
+
+        try:
+            prime_values = tuple(primes)
+            index_values = tuple(indices)
+            endpoint_values = tuple(endpoints)
+            modulus_values = tuple(moduli)
+        except TypeError:
+            raise TypeError("packed result metadata must be iterable sequences")
+
+        batch_count = len(prime_values)
+        if (len(index_values) != batch_count
+                or len(endpoint_values) != batch_count
+                or len(modulus_values) != batch_count):
+            raise ValueError("packed result metadata sequences must have equal lengths")
+
+        rows_value = _ring_integer(rows, "rows")
+        columns_value = _ring_integer(columns, "columns")
+        if rows_value <= 0 or columns_value <= 0:
+            raise ValueError("packed result rows and columns must be positive")
+        int_max = Integer(2) ** (8 * sizeof(int) - 1) - 1
+        if rows_value > int_max or columns_value > int_max:
+            raise OverflowError("packed result dimensions do not fit a C int")
+
+        plane_count = 2 * rows_value * columns_value
+        if plane_count > int_max:
+            raise OverflowError("packed result plane exceeds the native C int limit")
+        packed_count = Integer(batch_count) * plane_count
+        if packed_count > int_max:
+            raise OverflowError("packed result exceeds the native C int limit")
+        py_ssize_max = Integer(2) ** (8 * sizeof(Py_ssize_t) - 1) - 1
+        if packed_count > py_ssize_max // sizeof(uint64_t):
+            raise OverflowError("packed result is too large for a Python buffer")
+        expected_nbytes = int(packed_count * sizeof(uint64_t))
+        if len(buffer) != expected_nbytes:
             raise ValueError("packed result storage does not match its shape")
+
+        normalized_primes = []
+        normalized_endpoints = []
+        normalized_moduli = []
+        for position in range(batch_count):
+            prime_value = _ring_integer(prime_values[position], "each prime")
+            if not _packed_p2_endpoint_supported(prime_value, sizeof(long)):
+                raise PackedP2UnsupportedDomain(
+                    "packed result prime endpoint is outside the native C long/uint32 domain"
+                )
+            endpoint_value = _ring_integer(
+                endpoint_values[position], "each endpoint"
+            )
+            modulus_value = _ring_integer(
+                modulus_values[position], "each modulus"
+            )
+            if endpoint_value != prime_value:
+                raise ValueError("packed result endpoints must equal their primes")
+            if modulus_value != prime_value * prime_value:
+                raise ValueError("packed result moduli must be the prime squares")
+            if (construction_token is not _PACKED_P2_RESULT_TOKEN
+                    and not prime_value.is_prime(proof=True)):
+                raise PackedP2UnsupportedDomain(
+                    "packed result metadata requires prime values"
+                )
+            normalized_primes.append(prime_value)
+            normalized_endpoints.append(endpoint_value)
+            normalized_moduli.append(modulus_value)
+
         self._buffer = buffer
-        self.primes = primes
-        self.indices = indices
-        self.endpoints = endpoints
-        self.moduli = moduli
-        self.rows = rows
-        self.columns = columns
+        self.primes = tuple(normalized_primes)
+        self.indices = index_values
+        self.endpoints = tuple(normalized_endpoints)
+        self.moduli = tuple(normalized_moduli)
+        self.rows = int(rows_value)
+        self.columns = int(columns_value)
 
     @property
     def buffer(self):
@@ -113,7 +183,7 @@ cdef class PackedP2ForestResult:
 
 def _construct_packed_p2_result(*args):
     """Private construction seam used to exercise post-native cleanup."""
-    return PackedP2ForestResult(*args)
+    return PackedP2ForestResult(*args, _PACKED_P2_RESULT_TOKEN)
 
 
 cpdef remainder_forest(M, m, k, kbase=0, indices=None, V=None, ans=None, kappa=None,  cutoff=None, projective=False):
@@ -390,6 +460,18 @@ def _ring_integer(value, label):
     return Integer(value)
 
 
+def _packed_p2_endpoint_limit(long_size):
+    """Return the packed prime cap for a signed C long of ``long_size`` bytes."""
+    uint32_max = Integer(2) ** 32 - 1
+    long_max = Integer(2) ** (8 * long_size - 1) - 1
+    return min(uint32_max, long_max)
+
+
+def _packed_p2_endpoint_supported(prime, long_size):
+    """Whether ``prime`` can be used as a packed endpoint on this C ABI."""
+    return 2 <= prime <= _packed_p2_endpoint_limit(long_size)
+
+
 def _ring_batch_value(values, position, index):
     if isinstance(values, dict):
         return values[index]
@@ -490,6 +572,9 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
         raise OverflowError("nP does not fit a C int")
     if packed_p2 and (not fixed_p2 or nP != 2):
         raise ValueError("packed output is available only for the fixed P² forest")
+    packed_endpoint_limit = (
+        _packed_p2_endpoint_limit(sizeof(long)) if packed_p2 else None
+    )
 
     if not hasattr(M, "is_square") or not M.is_square():
         raise ValueError("M must be a square Sage matrix")
@@ -541,10 +626,11 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
             prime_value = _ring_integer(
                 _ring_batch_value(m, position, index), "each prime"
             )
-            if (prime_value < 2 or prime_value > Integer(2) ** 32 - 1
+            if (not _packed_p2_endpoint_supported(prime_value, sizeof(long))
                     or not prime_value.is_prime(proof=True)):
                 raise PackedP2UnsupportedDomain(
-                    "packed P² output requires primes in the uint32 domain"
+                    "packed P² output requires primes in the native C long/uint32 endpoint domain (maximum %s)"
+                    % packed_endpoint_limit
                 )
             prime_values.append(prime_value)
             m_value = prime_value * prime_value
@@ -833,7 +919,7 @@ def remainder_forest_p2(M, m, k, kbase=0, indices=None, V=None,
 
 def remainder_forest_p2_packed(M, primes, kbase=0, indices=None, V=None,
                                kappa=None):
-    r"""Return a packed P² forest for primes in the uint32 range.
+    r"""Return a packed P² forest for primes supported by the native ABI.
 
     For each prime ``p``, compute ``V*M(kbase)*...*M(p-1)`` modulo ``p^2``
     with formal ``P^2 = 0``. The input matrix and optional rectangular ``V``
@@ -842,7 +928,11 @@ def remainder_forest_p2_packed(M, primes, kbase=0, indices=None, V=None,
     existing batch conventions. With ``indices``, those keys are visited and
     retained in exactly that order. Since the native forest requires
     nondecreasing endpoints, the corresponding prime values must also be
-    nondecreasing.
+    nondecreasing. The packed endpoint domain is ``2 <= p <=
+    min(2^32-1, LONG_MAX)``, where ``LONG_MAX`` is the largest signed value of
+    the host's native C ``long``. Thus hosts with a 64-bit ``long`` support the
+    full uint32 prime range, while narrower hosts classify larger endpoints
+    as :class:`PackedP2UnsupportedDomain` before native marshalling.
 
     Each result is a :class:`PackedP2ForestResult`. Its immutable native-endian
     ``uint64`` buffer has logical shape ``(batch, 2, rows, columns)``. The
@@ -856,8 +946,9 @@ def remainder_forest_p2_packed(M, primes, kbase=0, indices=None, V=None,
     forest calls.
 
     Raises :class:`PackedP2UnsupportedDomain` if a value is composite or
-    outside ``2 <= p <= 2^32-1``. A consumer can catch that exception and use
-    :func:`remainder_forest_p2` for its arbitrary-precision fallback.
+    outside the host's supported endpoint domain. A consumer can catch that
+    exception and use :func:`remainder_forest_p2` for its arbitrary-precision
+    fallback.
     """
     return _remainder_forest_ring(
         M,

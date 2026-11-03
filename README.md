@@ -83,11 +83,15 @@ evaluated at each transition index; `P` remains formal.
 truncated before the native call.
 
 `remainder_forest_p2_packed` is an explicit opt-in output path for prime
-moduli `p^2`, with endpoint `k=p`. It accepts primes `2 <= p <= 2^32-1` in
-nondecreasing order and rejects composites or values outside that range with
-`PackedP2UnsupportedDomain`. Catch that exception when a consumer needs to
-fall back to the arbitrary-precision `remainder_forest_p2` interface. The
-ordinary Sage matrix functions keep their existing result type and behavior.
+moduli `p^2`, with endpoint `k=p`. It accepts primes in nondecreasing order
+from `2` through `min(2^32-1, LONG_MAX)`, where `LONG_MAX` is the largest
+signed value of the host's native C `long`. A 64-bit `long` supports the full
+uint32 prime range; a narrower `long` caps the packed endpoint domain at its
+representable maximum. The function rejects composites and unsupported
+endpoints with `PackedP2UnsupportedDomain` before passing any endpoint to C.
+Catch that exception when a consumer needs to fall back to the
+arbitrary-precision `remainder_forest_p2` interface. The ordinary Sage matrix
+functions keep their existing result type and behavior.
 
 The packed result has logical shape `(batch, 2, rows, columns)`: for each
 prime, plane 0 contains `P^0`, plane 1 contains `P^1`, and each matrix plane is
@@ -98,6 +102,10 @@ index is `(((batch_position*2 + plane)*rows + row)*columns + column)`.
 `result.matrix(batch_position, plane)` returns one shaped read-only matrix
 view, and `result.buffer` exposes the immutable bytes that own the copy.
 Every coefficient is checked to lie in `[0, p^2)` before export.
+`PackedP2ForestResult` snapshots metadata sequences as tuples. Direct
+construction validates aligned metadata, the supported prime/endpoint/modulus
+relationship, positive matrix dimensions, and shape/storage size before it
+exposes a view.
 
 For Trace inputs, the same function can be used for each matrix and the scalar
 call, with `V` omitted for the identity matrix:
