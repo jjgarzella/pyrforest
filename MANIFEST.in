@@ -1,0 +1,4 @@
+include pyrforest/native_pn.h
+include pyrforest/native_pn.pxd
+include tests/build_native_pn_consumer.py
+include tests/native_pn_consumer.pyx

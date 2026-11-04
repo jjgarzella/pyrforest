@@ -48,5 +48,7 @@ rforest = Extension(
 )
 
 setup(
+    include_package_data=True,
+    package_data={"pyrforest": ["native_pn.h", "native_pn.pxd"]},
     ext_modules=cythonize([rforest], include_path=sage_include_directories()),
 )
