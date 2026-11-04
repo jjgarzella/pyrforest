@@ -53,7 +53,7 @@ cdef class PackedP2ForestResult:
     """Immutable owner of a validated row-major P⁰/P¹ uint64 result.
 
     Metadata sequences are copied to tuples. Direct construction validates
-    their alignment, prime domain, positive dimensions, and byte size.
+    their alignment, prime domain, canonical words, dimensions, and buffer size.
     """
 
     cdef object _buffer
@@ -67,6 +67,14 @@ cdef class PackedP2ForestResult:
     def __cinit__(self, object buffer, object primes, object indices,
                   object endpoints, object moduli, object rows, object columns,
                   object construction_token=None):
+        cdef const uint64_t[::1] coefficient_words
+        cdef uint64_t modulus_word
+        cdef Py_ssize_t plane_words_c
+        cdef Py_ssize_t first_word
+        cdef Py_ssize_t last_word
+        cdef Py_ssize_t word_index
+        cdef Py_ssize_t batch_position
+
         if not isinstance(buffer, bytes):
             raise TypeError("packed result storage must be immutable bytes")
 
@@ -86,22 +94,11 @@ cdef class PackedP2ForestResult:
 
         rows_value = _ring_integer(rows, "rows")
         columns_value = _ring_integer(columns, "columns")
-        if rows_value <= 0 or columns_value <= 0:
-            raise ValueError("packed result rows and columns must be positive")
-        int_max = Integer(2) ** (8 * sizeof(int) - 1) - 1
-        if rows_value > int_max or columns_value > int_max:
-            raise OverflowError("packed result dimensions do not fit a C int")
-
-        plane_count = 2 * rows_value * columns_value
-        if plane_count > int_max:
-            raise OverflowError("packed result plane exceeds the native C int limit")
-        packed_count = Integer(batch_count) * plane_count
-        if packed_count > int_max:
-            raise OverflowError("packed result exceeds the native C int limit")
-        py_ssize_max = Integer(2) ** (8 * sizeof(Py_ssize_t) - 1) - 1
-        if packed_count > py_ssize_max // sizeof(uint64_t):
-            raise OverflowError("packed result is too large for a Python buffer")
-        expected_nbytes = int(packed_count * sizeof(uint64_t))
+        plane_count, packed_count, expected_nbytes = _packed_p2_output_size(
+            batch_count, rows_value, columns_value, sizeof(int),
+            sizeof(long), sizeof(size_t), sizeof(Py_ssize_t)
+        )
+        expected_nbytes = int(expected_nbytes)
         if len(buffer) != expected_nbytes:
             raise ValueError("packed result storage does not match its shape")
 
@@ -132,6 +129,21 @@ cdef class PackedP2ForestResult:
             normalized_primes.append(prime_value)
             normalized_endpoints.append(endpoint_value)
             normalized_moduli.append(modulus_value)
+
+        if construction_token is not _PACKED_P2_RESULT_TOKEN:
+            coefficient_words = memoryview(buffer).cast("Q")
+            plane_words_c = <Py_ssize_t>plane_count
+            for batch_position in range(<Py_ssize_t>batch_count):
+                modulus_word = <uint64_t>int(
+                    normalized_moduli[batch_position]
+                )
+                first_word = batch_position * plane_words_c
+                last_word = first_word + plane_words_c
+                for word_index in range(first_word, last_word):
+                    if coefficient_words[word_index] >= modulus_word:
+                        raise ValueError(
+                            "packed result coefficient is not canonical modulo p²"
+                        )
 
         self._buffer = buffer
         self.primes = tuple(normalized_primes)
@@ -472,6 +484,46 @@ def _packed_p2_endpoint_supported(prime, long_size):
     return 2 <= prime <= _packed_p2_endpoint_limit(long_size)
 
 
+def _packed_p2_output_size(batch_count, rows, columns, int_size, long_size,
+                           size_t_size, py_ssize_t_size):
+    """Validate packed P² dimensions and return plane words, total words, bytes.
+
+    The plane and total counts use the same C-int, native-long, size_t, and
+    Python-buffer limits for direct result construction and factory preflight.
+    Width arguments are explicit so allocation-free boundary tests can model
+    other ABIs without claiming to run them.
+    """
+    batch_count = Integer(batch_count)
+    rows = Integer(rows)
+    columns = Integer(columns)
+    if batch_count < 0:
+        raise ValueError("packed result batch count cannot be negative")
+    if rows <= 0 or columns <= 0:
+        raise ValueError("packed result rows and columns must be positive")
+    if min(int_size, long_size, size_t_size, py_ssize_t_size) <= 0:
+        raise ValueError("packed result ABI widths must be positive")
+
+    int_max = Integer(2) ** (8 * int_size - 1) - 1
+    if rows > int_max or columns > int_max:
+        raise OverflowError("packed result dimensions do not fit a C int")
+    plane_count = 2 * rows * columns
+    if plane_count > int_max:
+        raise OverflowError("packed result plane exceeds the native C int limit")
+
+    packed_count = batch_count * plane_count
+    long_max = Integer(2) ** (8 * long_size - 1) - 1
+    if packed_count > long_max:
+        raise OverflowError("packed result exceeds the native C long limit")
+
+    size_t_max = Integer(2) ** (8 * size_t_size) - 1
+    if packed_count > size_t_max // sizeof(uint64_t):
+        raise OverflowError("packed result is too large for native size_t")
+    py_ssize_max = Integer(2) ** (8 * py_ssize_t_size - 1) - 1
+    if packed_count > py_ssize_max // sizeof(uint64_t):
+        raise OverflowError("packed result is too large for a Python buffer")
+    return plane_count, packed_count, packed_count * sizeof(uint64_t)
+
+
 def _ring_batch_value(values, position, index):
     if isinstance(values, dict):
         return values[index]
@@ -690,12 +742,14 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
             raise OverflowError("%s array exceeds the native long limit" % label)
 
     if packed_p2:
-        packed_count = n * 2 * rows * dim
-        py_ssize_max = Integer(2) ** (8 * sizeof(Py_ssize_t) - 1) - 1
-        if packed_count > py_ssize_max // sizeof(uint64_t):
-            raise OverflowError("packed output is too large for a Python buffer")
+        _, packed_count, packed_nbytes = (
+            _packed_p2_output_size(
+                n, rows, dim, sizeof(int), sizeof(long), sizeof(size_t),
+                sizeof(Py_ssize_t)
+            )
+        )
         packed_count_c = <size_t>packed_count
-        packed_nbytes_c = <Py_ssize_t>(packed_count_c * sizeof(uint64_t))
+        packed_nbytes_c = <Py_ssize_t>packed_nbytes
 
     if n == 0:
         if packed_p2:

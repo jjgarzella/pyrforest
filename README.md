@@ -104,8 +104,10 @@ view, and `result.buffer` exposes the immutable bytes that own the copy.
 Every coefficient is checked to lie in `[0, p^2)` before export.
 `PackedP2ForestResult` snapshots metadata sequences as tuples. Direct
 construction validates aligned metadata, the supported prime/endpoint/modulus
-relationship, positive matrix dimensions, and shape/storage size before it
-exposes a view.
+relationship, positive matrix dimensions, canonical coefficient words, and
+shape/storage limits before it exposes a view. Total packed words are bounded
+by native indexing and Python buffer limits; each batch plane remains C-int
+bounded.
 
 For Trace inputs, the same function can be used for each matrix and the scalar
 call, with `V` omitted for the identity matrix:

@@ -2,6 +2,7 @@
 
 import gc
 import ctypes
+import struct
 from pathlib import Path
 
 from sage.all import Integers, LaurentPolynomialRing, Matrix, PolynomialRing, QQ, ZZ, prod
@@ -480,6 +481,28 @@ def main():
     assert directly_constructed.coefficients.format == "Q"
     assert directly_constructed.coefficients.readonly
 
+    # Direct construction validates each P^0/P^1 word against its batch
+    # modulus. This first-batch probe reproduced the old 6b59102 defect.
+    assert_raises(
+        ValueError,
+        lambda: PackedP2ForestResult(
+            b"\xff" * 16, [5], [0], [5], [25], 1, 1
+        ),
+    )
+    valid_boundary_words = struct.pack("=QQQQ", 24, 24, 48, 48)
+    valid_boundary_result = PackedP2ForestResult(
+        valid_boundary_words, [5, 7], [0, 1], [5, 7], [25, 49], 1, 1
+    )
+    assert tuple(valid_boundary_result.coefficients) == (24, 24, 48, 48)
+    # The last word is batch 1's P^1 plane; its modulus must be that batch's 49.
+    later_batch_bad_plane = struct.pack("=QQQQ", 24, 24, 48, 49)
+    assert_raises(
+        ValueError,
+        lambda: PackedP2ForestResult(
+            later_batch_bad_plane, [5, 7], [0, 1], [5, 7], [25, 49], 1, 1
+        ),
+    )
+
     direct_empty = PackedP2ForestResult(b"", [], [], [], [], 1, 1)
     assert direct_empty.shape == (0, 2, 1, 1)
     assert len(direct_empty.coefficients) == 0
@@ -510,6 +533,46 @@ def main():
         OverflowError,
         lambda: PackedP2ForestResult(
             b"", [5], [0], [5], [25], c_int_max, c_int_max
+        ),
+    )
+
+    int_size = ctypes.sizeof(ctypes.c_int)
+    long_size = ctypes.sizeof(ctypes.c_long)
+    size_t_size = ctypes.sizeof(ctypes.c_size_t)
+    py_ssize_t_size = ctypes.sizeof(ctypes.c_ssize_t)
+    if long_size >= 8 and size_t_size >= 8 and py_ssize_t_size >= 8:
+        # More than INT_MAX total words are valid on a 64-bit ABI when the
+        # per-batch plane and actual long/size_t/Py_ssize_t limits still fit.
+        batch_count = c_int_max // 2 + 1
+        plane_words, total_words, total_bytes = binding_module._packed_p2_output_size(
+            batch_count, 1, 1, int_size, long_size, size_t_size, py_ssize_t_size
+        )
+        assert int(plane_words) == 2
+        assert int(total_words) == c_int_max + 1
+        assert int(total_words) > c_int_max
+        assert int(total_bytes) == (c_int_max + 1) * 8
+
+    py_ssize_max = 2 ** (8 * py_ssize_t_size - 1) - 1
+    overflow_batch_count = py_ssize_max // 16 + 1
+    assert_raises(
+        OverflowError,
+        lambda: binding_module._packed_p2_output_size(
+            overflow_batch_count, 1, 1, int_size, long_size,
+            size_t_size, py_ssize_t_size,
+        ),
+    )
+    # Synthetic widths exercise the native-long and size_t fences without a
+    # large allocation or claiming that a 32-bit ABI was built and run.
+    assert_raises(
+        OverflowError,
+        lambda: binding_module._packed_p2_output_size(
+            (2**31 - 1) // 2 + 1, 1, 1, 4, 4, 8, 8,
+        ),
+    )
+    assert_raises(
+        OverflowError,
+        lambda: binding_module._packed_p2_output_size(
+            (2**32 - 1) // 16 + 1, 1, 1, 4, 8, 4, 8,
         ),
     )
 
