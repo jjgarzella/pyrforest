@@ -3,9 +3,14 @@
 Usage: sage -python tests/build_native_pn_consumer.py path/to/pyrforest.whl
 """
 
+import hashlib
 import importlib
+import importlib.machinery
+import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import zipfile
 from pathlib import Path
 
@@ -25,9 +30,51 @@ def _sage_includes():
         return [str(path) for path in sage_include_directories()]
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_inside(path, root, description):
+    if path is None:
+        raise AssertionError(f"{description} was not loaded")
+    path = Path(path).resolve()
+    root = Path(root).resolve()
+    if not path.is_file():
+        raise AssertionError(f"{description} is not a file: {path}")
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise AssertionError(
+            f"{description} resolved outside the expected wheel directory: {path}"
+        ) from error
+    return path
+
+
+def _validated_producer_paths(package_path, extension_path, package_dir):
+    package_path = _file_inside(package_path, package_dir, "producer package")
+    extension_path = _file_inside(
+        extension_path, package_dir, "compiled producer extension"
+    )
+    if not any(
+        extension_path.name.endswith(suffix)
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ):
+        raise AssertionError(
+            f"producer did not load from a compiled extension: {extension_path}"
+        )
+    return package_path, extension_path
+
+
 def build_consumer(wheel_path):
     wheel_path = Path(wheel_path).resolve()
     source = Path(__file__).with_name("native_pn_consumer.pyx").resolve()
+    if not wheel_path.is_file():
+        raise FileNotFoundError(wheel_path)
+    print(f"WHEEL_ARCHIVE {wheel_path} sha256={_sha256(wheel_path)}")
     with tempfile.TemporaryDirectory(prefix="pyrforest-pn-consumer-") as work:
         root = Path(work)
         unpacked = root / "wheel"
@@ -61,19 +108,102 @@ def build_consumer(wheel_path):
         command.build_temp = str(root / "build")
         command.ensure_finalized()
         command.run()
-        sys.path.insert(0, command.build_lib)
-        try:
-            return importlib.import_module("native_pn_consumer")
-        finally:
-            sys.path.remove(command.build_lib)
+
+        # A conflicting package on PYTHONPATH reproduces the original failure
+        # mode. The isolated child must ignore it and prove that the extracted
+        # wheel supplied both the package and compiled producer extension.
+        ambient = root / "ambient"
+        ambient_package = ambient / "pyrforest"
+        ambient_package.mkdir(parents=True)
+        marker = root / "ambient-producer-imported"
+        (ambient_package / "__init__.py").write_text(
+            textwrap.dedent(f"""\
+            from pathlib import Path
+            Path({str(marker)!r}).write_text("imported")
+            raise RuntimeError("ambient pyrforest producer sentinel imported")
+            """)
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(
+            value for value in (env.get("PYTHONPATH"), str(ambient)) if value
+        )
+        runner = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(Path(__file__).resolve()),
+                "--isolated-consumer",
+                str(unpacked),
+                str(command.build_lib),
+            ],
+            cwd=root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if runner.stdout:
+            print(runner.stdout, end="")
+        if runner.returncode:
+            if runner.stderr:
+                print(runner.stderr, file=sys.stderr, end="")
+            raise RuntimeError(
+                f"isolated wheel consumer exited with status {runner.returncode}"
+            )
+        if marker.exists():
+            raise AssertionError("ambient producer sentinel was imported")
+        print(f"AMBIENT_SENTINEL {ambient_package} ignored under PYTHONPATH")
 
 
-def main():
-    if len(sys.argv) != 2:
-        raise SystemExit(__doc__)
-    consumer = build_consumer(sys.argv[1])
+def _run_isolated_consumer(wheel_root, consumer_lib):
+    wheel_root = Path(wheel_root).resolve()
+    consumer_lib = Path(consumer_lib).resolve()
+    package_dir = wheel_root / "pyrforest"
+    header = package_dir / "native_pn.h"
+    pxd = package_dir / "native_pn.pxd"
+    for required in (header, pxd):
+        if not required.is_file():
+            raise AssertionError(f"wheel omitted required ABI file: {required}")
 
+    # The extension uses Sage's Cython and symbolic runtime; initialize Sage
+    # before importing the producer package, as documented for consumers.
     from sage.all import Integers, Matrix, PolynomialRing, ZZ
+
+    # The child runs from a temporary working directory under Python's isolated
+    # mode. Only these explicit paths can supply the producer and consumer.
+    sys.path.insert(0, str(wheel_root))
+    sys.path.insert(0, str(consumer_lib))
+    package = importlib.import_module("pyrforest")
+    extension = importlib.import_module("pyrforest.rforest")
+    consumer = importlib.import_module("native_pn_consumer")
+    package_path, extension_path = _validated_producer_paths(
+        package.__file__, extension.__file__, package_dir
+    )
+    package_dir_loaded = Path(next(iter(package.__path__))).resolve()
+    if package_dir_loaded != package_dir.resolve():
+        raise AssertionError(
+            f"producer package directory came from {package_dir_loaded}, "
+            f"expected extracted wheel at {package_dir.resolve()}"
+        )
+    consumer_path = _file_inside(
+        consumer.__file__, consumer_lib, "compiled consumer extension"
+    )
+    if not any(
+        consumer_path.name.endswith(suffix)
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ):
+        raise AssertionError(
+            f"consumer was not loaded from a compiled extension: {consumer_path}"
+        )
+
+    print(f"PRODUCER_PACKAGE {package_path} sha256={_sha256(package_path)}")
+    print(f"PRODUCER_EXTENSION {extension_path} sha256={_sha256(extension_path)}")
+    print(f"WHEEL_HEADER {header.resolve()} sha256={_sha256(header)}")
+    print(f"WHEEL_PXD {pxd.resolve()} sha256={_sha256(pxd)}")
+    consumer_source = Path(__file__).with_name("native_pn_consumer.pyx").resolve()
+    print(f"CONSUMER_SOURCE {consumer_source} sha256={_sha256(consumer_source)}")
+    print(f"CONSUMER_EXTENSION {consumer_path} sha256={_sha256(consumer_path)}")
+
     from pyrforest import remainder_forest_pn, remainder_forest_pn_native
 
     ring = PolynomialRing(ZZ, names=("P", "x"))
@@ -216,6 +346,15 @@ def main():
         raise AssertionError("consumer accepted a capsule with the wrong name")
     print("GMP ABI build tuple: %r" % (observed["gmp"],))
     print("PASS packaged PN GMP ABI compiled consumer; exact large-modulus values and capsule lifetime")
+
+
+def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--isolated-consumer":
+        _run_isolated_consumer(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 2:
+        build_consumer(sys.argv[1])
+    else:
+        raise SystemExit(__doc__)
 
 
 if __name__ == "__main__":

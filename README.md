@@ -63,11 +63,18 @@ checks from the checkout:
 ```
 python -m sage.doctest --force-lib pyrforest
 python tests/test_ring_forest_bindings.py
+python tests/test_build_native_pn_consumer.py
 make -C pyrforest/lib check
 ```
 
 To verify the separately compiled PN consumer against the files actually
-included in a wheel, build a wheel and pass it to the retained consumer test:
+included in a wheel, build a wheel and pass it to the retained consumer test.
+The helper extracts the wheel, compiles against its header and Cython
+declaration, then runs the producer and consumer in an isolated child process.
+It prints the loaded package, compiled extension, consumer, header, and
+declaration paths with SHA-256 hashes, and exercises a conflicting ambient
+`PYTHONPATH` sentinel so a source checkout or older installed producer cannot
+make the check pass accidentally:
 
 ```
 python setup.py bdist_wheel --dist-dir build/dist
