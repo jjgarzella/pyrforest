@@ -53,6 +53,7 @@ from pyrforest import (
     remainder_forest_p2,
     remainder_forest_p2_packed,
     remainder_forest_pn,
+    remainder_forest_pn_native,
 )
 ```
 
@@ -62,7 +63,22 @@ checks from the checkout:
 ```
 python -m sage.doctest --force-lib pyrforest
 python tests/test_ring_forest_bindings.py
+python tests/test_build_native_pn_consumer.py
 make -C pyrforest/lib check
+```
+
+To verify the separately compiled PN consumer against the files actually
+included in a wheel, build a wheel and pass it to the retained consumer test.
+The helper extracts the wheel, compiles against its header and Cython
+declaration, then runs the producer and consumer in an isolated child process.
+It prints the loaded package, compiled extension, consumer, header, and
+declaration paths with SHA-256 hashes, and exercises a conflicting ambient
+`PYTHONPATH` sentinel so a source checkout or older installed producer cannot
+make the check pass accidentally:
+
+```
+python setup.py bdist_wheel --dist-dir build/dist
+sage -python tests/build_native_pn_consumer.py build/dist/pyrforest-*.whl
 ```
 
 ## Functions provided
@@ -71,6 +87,7 @@ make -C pyrforest/lib check
 #### remainder_forest_p2(M, m, k, kbase=0, indices=None, V=None, kappa=None, return_state=False, *, z=None)
 #### remainder_forest_p2_packed(M, primes, kbase=0, indices=None, V=None, kappa=None)
 #### remainder_forest_pn(M, m, k, nP, kbase=0, indices=None, V=None, kappa=None, return_state=False, *, z=None)
+#### remainder_forest_pn_native(M, m, k, nP, kbase=0, indices=None, V=None, kappa=None, return_state=False, *, z=None)
 #### remainder_forest_generic_prime(M, d, e, k, indices=None, m=None, kbase=0, V=None, ans=None, kappa=None)
 
 The ring functions accept an exact Sage matrix over a two-generator polynomial
@@ -108,6 +125,38 @@ relationship, positive matrix dimensions, canonical coefficient words, and
 shape/storage limits before it exposes a view. Total packed words are bounded
 by native indexing and Python buffer limits; each batch plane remains C-int
 bounded.
+
+`remainder_forest_pn_native` is a separate opt-in arbitrary-precision output
+path. It retains the same general PN inputs as `remainder_forest_pn`, including
+independent formal precision `nP`, arbitrary positive GMP moduli, caller
+indices, and native C `long` endpoints. Its immutable
+`NativePnForestResult` reports `shape == (batch, nP, rows, columns)` plus
+separate tuples for `indices`, `endpoints`, and `moduli`. Endpoints are the
+actual requested forest endpoints; they are not inferred from the moduli and
+need not equal any prime. Coefficients stay in producer-owned GMP storage and
+are not converted to per-coefficient Python or Sage integers. `return_state`
+is unsupported on this result path; use `remainder_forest_pn` when the final
+`V` state is needed.
+
+Compiled consumers call `result.as_capsule()` and keep both the result and
+capsule alive for the complete native call. Each call returns a fresh capsule;
+the capsule holds a strong reference to the result, so its pointers remain
+valid even if the caller drops its direct result reference. Pointers must not
+be retained after the capsule/owner lifetime or used to modify the source
+GMP values. The fixed name is
+`pyrforest.PnGmpForestResult/v1`; `pyrforest/native_pn.h` and
+`pyrforest/native_pn.pxd` define the matching versioned ABI. The C-contiguous
+coefficient order is `(batch, degree, row, column)`, with offset
+`(((batch*nP + degree)*rows + row)*columns + column)`. Each coefficient is
+canonical in `[0, moduli[batch])`. The payload records exact GMP version and
+limb sizes so consumers can reject incompatible builds before reading data.
+
+The public feature markers are `PN_GMP_RESULT_ABI_VERSION == 1`,
+`PN_GMP_RESULT_CAPABILITY == "pn-gmp-result-v1"`, and
+`PN_GMP_RESULT_CAPSULE_NAME == "pyrforest.PnGmpForestResult/v1"`. Wheels and
+source distributions include the ABI header and Cython declaration. A
+compiled client should cimport `pyrforest.native_pn` and add the installed
+`pyrforest` package directory to its C compiler include path.
 
 For Trace inputs, the same function can be used for each matrix and the scalar
 call, with `V` omitted for the identity matrix:

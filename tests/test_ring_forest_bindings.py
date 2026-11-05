@@ -9,12 +9,17 @@ from sage.all import Integers, LaurentPolynomialRing, Matrix, PolynomialRing, QQ
 
 from pyrforest import (
     PACKED_P2_UINT64_CAPABILITY,
+    PN_GMP_RESULT_ABI_VERSION,
+    PN_GMP_RESULT_CAPABILITY,
+    PN_GMP_RESULT_CAPSULE_NAME,
+    NativePnForestResult,
     PackedP2ForestResult,
     PackedP2UnsupportedDomain,
     remainder_forest,
     remainder_forest_p2,
     remainder_forest_p2_packed,
     remainder_forest_pn,
+    remainder_forest_pn_native,
 )
 from pyrforest.rforest import deflate_matrix, inflate_matrix
 import pyrforest.rforest as binding_module
@@ -218,6 +223,70 @@ def main():
         V=V,
     )
     assert callable_keyed == keyed
+
+    # The opt-in GMP owner keeps general PN endpoint/modulus metadata distinct
+    # and does not materialize its coefficient array as Python objects.
+    native_moduli = [2**300 + 17, 2**270 + 33]
+    native_endpoints = [2, 3]
+    native_indices = ("second-source", "fourth-source")
+    native_result = remainder_forest_pn_native(
+        M,
+        native_moduli,
+        native_endpoints,
+        3,
+        kbase=kbase,
+        indices=native_indices,
+        V=V,
+        kappa=1,
+    )
+    assert isinstance(native_result, NativePnForestResult)
+    assert native_result.shape == (2, 3, V.nrows(), M.ncols())
+    assert native_result.indices == native_indices
+    assert native_result.endpoints == tuple(native_endpoints)
+    assert native_result.moduli == tuple(native_moduli)
+    assert native_result.endpoints != native_result.moduli
+    assert not hasattr(native_result, "coefficients")
+    assert PN_GMP_RESULT_ABI_VERSION == 1
+    assert PN_GMP_RESULT_CAPABILITY == "pn-gmp-result-v1"
+    assert PN_GMP_RESULT_CAPSULE_NAME == "pyrforest.PnGmpForestResult/v1"
+    assert "pyrforest.PnGmpForestResult/v1" in repr(native_result.as_capsule())
+    assert_raises(TypeError, lambda: NativePnForestResult())
+    assert_raises(
+        ValueError,
+        lambda: remainder_forest_pn_native(
+            M, native_moduli, native_endpoints, 3,
+            kbase=kbase, V=V, return_state=True,
+        ),
+    )
+    empty_native = remainder_forest_pn_native(M, [], [], 5, V=V)
+    assert empty_native.shape == (0, 5, V.nrows(), M.ncols())
+    assert empty_native.indices == empty_native.endpoints == empty_native.moduli == ()
+    assert "pyrforest.PnGmpForestResult/v1" in repr(empty_native.as_capsule())
+
+    # If Python metadata construction fails after the C forest returns, the
+    # producer still owns and clears every initialized GMP array; a later call
+    # verifies the extension remains usable.
+    native_result_factory = binding_module._construct_native_pn_result
+
+    def reject_native_result(*args):
+        raise RuntimeError("injected native result metadata failure")
+
+    binding_module._construct_native_pn_result = reject_native_result
+    try:
+        assert_raises(
+            RuntimeError,
+            lambda: remainder_forest_pn_native(
+                M, native_moduli, native_endpoints, 3,
+                kbase=kbase, V=V, kappa=1,
+            ),
+        )
+    finally:
+        binding_module._construct_native_pn_result = native_result_factory
+    recovered_native = remainder_forest_pn_native(
+        M, native_moduli, native_endpoints, 3,
+        kbase=kbase, V=V, kappa=1,
+    )
+    assert recovered_native.shape == native_result.shape
 
     expected_p2 = direct_ring_forest(M, moduli, endpoints, 2, kbase, V)
     for kappa in (0, 1, 3):
@@ -645,8 +714,8 @@ def main():
     later = remainder_forest_p2_packed(M, [7], kbase=kbase, V=V, kappa=1)
     assert tuple(held_view[r, c] for r in range(1) for c in range(2)) == held_values
 
-    # Positive control: the legacy path calls Sage result constructors; the
-    # packed path calls none of them after its Sage inputs already exist.
+    # Positive control: the legacy path calls Sage result constructors; both
+    # compiled-output paths bypass them after their Sage inputs already exist.
     constructor_counts = {"Matrix": 0, "Integers": 0, "PolynomialRing": 0}
     constructors = {
         name: getattr(binding_module, name) for name in constructor_counts
@@ -664,8 +733,8 @@ def main():
     for name in constructor_counts:
         setattr(binding_module, name, observe_constructor(name))
     try:
-        legacy_probe = remainder_forest_p2(
-            M, [25], [5], kbase=kbase, V=V, kappa=1
+        legacy_probe = remainder_forest_pn(
+            M, [25], [5], 2, kbase=kbase, V=V, kappa=1
         )
         assert legacy_probe
         assert constructor_counts["Matrix"] > 0
@@ -676,6 +745,11 @@ def main():
         packed_probe = remainder_forest_p2_packed(
             M, [5], kbase=kbase, V=V, kappa=1
         )
+        assert all(count == 0 for count in constructor_counts.values())
+        native_probe = remainder_forest_pn_native(
+            M, [25], [5], 2, kbase=kbase, V=V, kappa=1
+        )
+        assert isinstance(native_probe, NativePnForestResult)
         assert all(count == 0 for count in constructor_counts.values())
     finally:
         for name, constructor in constructors.items():

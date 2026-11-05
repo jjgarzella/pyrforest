@@ -12,6 +12,14 @@ and `k_i` and `m_i` are sequences of integers.
 """
 
 from cython cimport sizeof
+from cpython.pycapsule cimport (
+    PyCapsule_GetContext,
+    PyCapsule_IsValid,
+    PyCapsule_New,
+    PyCapsule_SetContext,
+)
+from cpython.object cimport PyObject
+from cpython.ref cimport Py_DECREF, Py_INCREF
 from cysignals.signals cimport sig_on, sig_off
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from libc.stddef cimport size_t
@@ -24,9 +32,11 @@ from sage.libs.gmp.mpz cimport (
     mpz_init,
     mpz_init_set,
     mpz_init_set_ui,
+    mpz_mod,
     mpz_sgn,
     mpz_set,
 )
+from sage.libs.gmp.types cimport mpz_srcptr, mpz_t
 from sage.combinat.integer_vector import IntegerVectors
 from sage.functions.log import log
 from sage.functions.other import ceil
@@ -36,10 +46,19 @@ from sage.rings.integer_ring import ZZ
 from sage.rings.finite_rings.integer_mod_ring import Integers
 from sage.rings.polynomial.laurent_polynomial_ring_base import LaurentPolynomialRing_generic
 from sage.rings.polynomial.polynomial_ring_constructor import PolynomialRing
+from pyrforest.native_pn cimport (
+    PYRFOREST_PN_GMP_RESULT_ABI_VERSION,
+    PYRFOREST_PN_GMP_RESULT_CAPSULE_NAME,
+    pyrforest_pn_gmp_result_v1,
+    pyrforest_pn_gmp_result_v1_init,
+)
 
 
 
 PACKED_P2_UINT64_CAPABILITY = 1
+PN_GMP_RESULT_ABI_VERSION = PYRFOREST_PN_GMP_RESULT_ABI_VERSION
+PN_GMP_RESULT_CAPABILITY = "pn-gmp-result-v1"
+PN_GMP_RESULT_CAPSULE_NAME = "pyrforest.PnGmpForestResult/v1"
 
 
 class PackedP2UnsupportedDomain(ValueError):
@@ -196,6 +215,155 @@ cdef class PackedP2ForestResult:
 def _construct_packed_p2_result(*args):
     """Private construction seam used to exercise post-native cleanup."""
     return PackedP2ForestResult(*args, _PACKED_P2_RESULT_TOKEN)
+
+
+cdef object _NATIVE_PN_RESULT_TOKEN = object()
+
+
+cdef void _native_pn_capsule_destructor(object capsule) noexcept:
+    cdef void *owner_pointer
+
+    if not PyCapsule_IsValid(capsule, PYRFOREST_PN_GMP_RESULT_CAPSULE_NAME):
+        return
+    owner_pointer = PyCapsule_GetContext(capsule)
+    if owner_pointer != NULL:
+        Py_DECREF(<object><PyObject *>owner_pointer)
+
+
+cdef class NativePnForestResult:
+    """Immutable owner for an arbitrary-precision PN GMP forest result.
+
+    Instances can only be created by the checked native producer. GMP storage
+    is not exposed as Python integers or a byte buffer. ``as_capsule()`` makes
+    a fresh, read-only ABI view whose lifetime pins this owner.
+    """
+
+    cdef mpz_t *_coefficients
+    cdef mpz_t *_moduli
+    cdef long *_endpoints
+    cdef size_t _coefficient_count
+    cdef size_t _batch_count
+    cdef bint _ready
+    cdef pyrforest_pn_gmp_result_v1 _payload
+    cdef readonly object indices
+    cdef readonly object endpoints
+    cdef readonly object moduli
+    cdef readonly int nP
+    cdef readonly int rows
+    cdef readonly int columns
+
+    def __cinit__(self, object construction_token=None):
+        self._coefficients = NULL
+        self._moduli = NULL
+        self._endpoints = NULL
+        self._coefficient_count = 0
+        self._batch_count = 0
+        self._ready = False
+        self.indices = ()
+        self.endpoints = ()
+        self.moduli = ()
+        self.nP = 0
+        self.rows = 0
+        self.columns = 0
+        pyrforest_pn_gmp_result_v1_init(
+            &self._payload, 0, 0, 0, 0, NULL, NULL, NULL
+        )
+        if construction_token is not _NATIVE_PN_RESULT_TOKEN:
+            raise TypeError(
+                "NativePnForestResult instances are created by the PN forest"
+            )
+
+    cdef void _adopt(self, mpz_t *coefficients, mpz_t *moduli,
+                     long *endpoints, size_t coefficient_count,
+                     size_t batch_count, int nP, int rows, int columns):
+        self._coefficients = coefficients
+        self._moduli = moduli
+        self._endpoints = endpoints
+        self._coefficient_count = coefficient_count
+        self._batch_count = batch_count
+        self.nP = nP
+        self.rows = rows
+        self.columns = columns
+        pyrforest_pn_gmp_result_v1_init(
+            &self._payload,
+            batch_count,
+            <size_t>nP,
+            <size_t>rows,
+            <size_t>columns,
+            <const long *>endpoints,
+            <mpz_srcptr>moduli,
+            <mpz_srcptr>coefficients,
+        )
+        self._ready = True
+
+    def __dealloc__(self):
+        cdef size_t i
+        for i in range(self._coefficient_count):
+            mpz_clear(self._coefficients[i])
+        if self._coefficients != NULL:
+            free(self._coefficients)
+        for i in range(self._batch_count):
+            mpz_clear(self._moduli[i])
+        if self._moduli != NULL:
+            free(self._moduli)
+        if self._endpoints != NULL:
+            free(self._endpoints)
+
+    @property
+    def shape(self):
+        """Logical coefficient layout ``(batch, nP, rows, columns)``."""
+        return (self._batch_count, self.nP, self.rows, self.columns)
+
+    def as_capsule(self):
+        """Return a fresh v1 capsule that holds this owner alive."""
+        cdef object capsule
+        if not self._ready:
+            raise RuntimeError("native PN result storage has not been adopted")
+        capsule = PyCapsule_New(
+            <void *>&self._payload,
+            PYRFOREST_PN_GMP_RESULT_CAPSULE_NAME,
+            _native_pn_capsule_destructor,
+        )
+        Py_INCREF(self)
+        try:
+            PyCapsule_SetContext(capsule, <void *>self)
+        except:
+            Py_DECREF(self)
+            raise
+        return capsule
+
+    def __repr__(self):
+        return "NativePnForestResult(shape=%r, endpoints=%r)" % (
+            self.shape, self.endpoints
+        )
+
+
+cdef NativePnForestResult _new_native_pn_result(
+        size_t batch_count, int nP, int rows, int columns,
+        object indices, object endpoint_values, object modulus_values):
+    cdef NativePnForestResult result
+    cdef object index_tuple = tuple(indices)
+    cdef object endpoint_tuple = tuple(endpoint_values)
+    cdef object modulus_tuple = tuple(modulus_values)
+
+    if (len(index_tuple) != batch_count
+            or len(endpoint_tuple) != batch_count
+            or len(modulus_tuple) != batch_count):
+        raise ValueError("native PN result metadata lengths are inconsistent")
+
+    result = NativePnForestResult(_NATIVE_PN_RESULT_TOKEN)
+    result.indices = index_tuple
+    result.endpoints = endpoint_tuple
+    result.moduli = modulus_tuple
+    return result
+
+
+def _construct_native_pn_result(batch_count, nP, rows, columns, indices,
+                                endpoint_values, modulus_values):
+    """Private metadata construction seam used by cleanup tests."""
+    return _new_native_pn_result(
+        batch_count, nP, rows, columns, indices, endpoint_values, modulus_values
+    )
 
 
 cpdef remainder_forest(M, m, k, kbase=0, indices=None, V=None, ans=None, kappa=None,  cutoff=None, projective=False):
@@ -589,7 +757,7 @@ def _ring_matrix_from_terms(terms, rows, dim, nP, modulus, p_name,
 
 def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
                            kappa=None, return_state=False, fixed_p2=False,
-                           initial_z=None, packed_p2=False):
+                           initial_z=None, packed_p2=False, native_pn=False):
     """Shared safe marshalling layer for the native P² and P^n forests."""
     cdef mpz_t *A1 = NULL
     cdef mpz_t *V1 = NULL
@@ -600,6 +768,7 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
     cdef mpz_t z
     cdef Integer tmp
     cdef Integer prime_value
+    cdef NativePnForestResult native_result
     cdef size_t A_initialized = 0
     cdef size_t V_initialized = 0
     cdef size_t M_initialized = 0
@@ -624,6 +793,10 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
         raise OverflowError("nP does not fit a C int")
     if packed_p2 and (not fixed_p2 or nP != 2):
         raise ValueError("packed output is available only for the fixed P² forest")
+    if native_pn and (fixed_p2 or packed_p2):
+        raise ValueError("native GMP output is available only for generic P^n")
+    if native_pn and return_state:
+        raise ValueError("native GMP output does not expose final_V state")
     packed_endpoint_limit = (
         _packed_p2_endpoint_limit(sizeof(long)) if packed_p2 else None
     )
@@ -756,6 +929,14 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
             return PackedP2ForestResult(
                 b"", tuple(), tuple(index_values), tuple(), tuple(), rows, dim
             )
+        if native_pn:
+            native_result_factory = globals()["_construct_native_pn_result"]
+            native_result = native_result_factory(
+                0, nP, rows, dim, index_values, (), ()
+            )
+            native_result._adopt(NULL, NULL, NULL, 0, 0,
+                                 nP, rows, dim)
+            return native_result
         if not return_state:
             return {}
         p_name = M.base_ring().variable_names()[0]
@@ -884,6 +1065,39 @@ def _remainder_forest_ring(M, m, k, nP, kbase=0, indices=None, V=None,
                 rows,
                 dim,
             )
+
+        if native_pn:
+            # The native algorithm returns modular residues. Normalize in GMP
+            # before publishing so all branches preserve Sage's canonical
+            # residue representatives, including any future signed native
+            # intermediate path.
+            for t in range(n):
+                for p in range(nP):
+                    for r in range(rows):
+                        for c in range(dim):
+                            output_offset = (
+                                ((t * nP + p) * rows + r) * native_dim + c
+                            )
+                            mpz_mod(A1[output_offset], A1[output_offset], m1[t])
+                            if (mpz_sgn(A1[output_offset]) < 0
+                                    or mpz_cmp(A1[output_offset], m1[t]) >= 0):
+                                raise ArithmeticError(
+                                    "native PN output is not canonical modulo its modulus"
+                                )
+
+            native_result_factory = globals()["_construct_native_pn_result"]
+            native_result = native_result_factory(
+                n, nP, rows, dim, index_values, k_values, m_values
+            )
+            native_result._adopt(A1, m1, k1, A_count_c, m_count_c,
+                                 nP_c, rows_c, dim_c)
+            # The owner is now solely responsible for clearing these arrays.
+            A1 = NULL
+            A_initialized = 0
+            m1 = NULL
+            m_initialized = 0
+            k1 = NULL
+            return native_result
 
         results = {}
         p_name = M.base_ring().variable_names()[0]
@@ -1034,6 +1248,41 @@ def remainder_forest_pn(M, m, k, nP, kbase=0, indices=None, V=None,
     """
     return _remainder_forest_ring(M, m, k, nP, kbase, indices, V, kappa,
                                   return_state, False, z)
+
+
+def remainder_forest_pn_native(M, m, k, nP, kbase=0, indices=None, V=None,
+                               kappa=None, return_state=False, *, z=None):
+    r"""Return an owned arbitrary-precision PN result for compiled consumers.
+
+    This opt-in API has the same input and endpoint semantics as
+    :func:`remainder_forest_pn`, but returns :class:`NativePnForestResult`
+    rather than constructing Sage polynomial matrices. Its capsule exposes a
+    versioned, read-only GMP ABI; the result owner remains alive for as long as
+    any capsule made by :meth:`NativePnForestResult.as_capsule` is alive.
+
+    ``nP`` is the formal truncation bound and each value in ``m`` is its
+    separate arbitrary-precision arithmetic modulus. ``endpoints`` in the
+    result preserve the requested native endpoints; they need not equal a
+    prime or modulus. ``return_state=True`` is unsupported because the native
+    result contract covers forest outputs only.
+    """
+    if return_state:
+        raise ValueError("native GMP output does not expose final_V state")
+    return _remainder_forest_ring(
+        M,
+        m,
+        k,
+        nP,
+        kbase=kbase,
+        indices=indices,
+        V=V,
+        kappa=kappa,
+        return_state=False,
+        fixed_p2=False,
+        initial_z=z,
+        packed_p2=False,
+        native_pn=True,
+    )
 
 def inflate_matrix(M, vars, e):
     """
